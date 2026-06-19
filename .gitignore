@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+.venv/
+
+# VS Code
+.vscode/
+
+# JetBrains
+.idea/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Python Build
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment Variables
+.env
+
+# Testing
+.pytest_cache/
+.coverage
+
+# Large Generated Datasets
+output/
+phase5/output/
+phase6/ingested/
+phase7/cleaned/
+
+# Generated Reports
+*.pdf
+*.xlsx
+*.csv
+
+# Keep sample configs
+!requirements.txt
+!README.md
