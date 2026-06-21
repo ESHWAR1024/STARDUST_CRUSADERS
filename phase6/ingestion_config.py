@@ -8,30 +8,28 @@ Defines:
 """
 
 # ---------------------------------------------------------------------------
-# Unified schema — every parser must produce exactly these columns
+# Unified schema
 # ---------------------------------------------------------------------------
 UNIFIED_SCHEMA = [
-    "account_id",           # from filename or metadata
-    "account_holder",       # from file header if present
-    "bank_name",            # detected from file header / registry
-    "date",                 # ISO format YYYY-MM-DD
-    "time",                 # HH:MM:SS (00:00:00 if not present)
-    "narration",            # transaction description
-    "channel",              # inferred from narration where possible
-    "debit",                # float, 0.0 if not applicable
-    "credit",               # float, 0.0 if not applicable
-    "balance",              # float
-    "utr_ref",              # reference / cheque number
-    "counterparty_name",    # from narration where extractable
-    "source_file",          # original filename for traceability
-    "source_format",        # csv | xlsx | pdf | image
-    "ingestion_warnings",   # pipe-separated list of issues found
+    "account_id",           
+    "account_holder",       
+    "bank_name",            
+    "date",                 
+    "time",                 
+    "narration",            
+    "channel",              
+    "debit",                
+    "credit",               
+    "balance",              
+    "utr_ref",              
+    "counterparty_name",    
+    "source_file",          
+    "source_format",        
+    "ingestion_warnings",   
 ]
 
 # ---------------------------------------------------------------------------
-# Per-bank format registry — maps each bank's native column names to
-# UNIFIED_SCHEMA fields. The ingestion pipeline auto-detects which bank
-# a statement belongs to by matching column headers.
+# Per-bank format registry
 # ---------------------------------------------------------------------------
 BANK_FORMAT_REGISTRY = {
     "SBI": {
@@ -94,21 +92,56 @@ BANK_FORMAT_REGISTRY = {
         "balance_col": "Balance",
         "date_formats": ["%d.%m.%Y", "%d/%m/%Y"],
     },
+    "AIRTEL": {
+        "bank_name": "Airtel Payments Bank",
+        "date_col": "Date",
+        "narration_col": "Particulars",
+        "ref_col": "Transaction ID",
+        "debit_col": "Withdrawal",
+        "credit_col": "Deposit",
+        "balance_col": "Balance",
+        "date_formats": ["%d-%m-%Y", "%d/%m/%Y"],
+    },
 }
 
-# Keyword → bank code mapping for header-line bank detection
+# Replace your current BANK_NAME_KEYWORDS with this expanded list
 BANK_NAME_KEYWORDS = {
-    "state bank": "SBI",
-    "sbi": "SBI",
+    # Top Public & Private
+    "state bank": "SBI", "sbi": "SBI",
     "hdfc": "HDFC",
     "icici": "ICICI",
     "axis": "AXIS",
     "canara": "CANARA",
-    "punjab national": "PNB",
-    "pnb": "PNB",
+    "punjab national": "PNB", "pnb": "PNB",
+    "bank of baroda": "BOB", "bob": "BOB",
+    "bank of india": "BOI", "boi": "BOI",
+    "union bank": "UBI",
+    "kotak": "KOTAK",
+    "indusind": "INDUSIND",
+    "yes bank": "YES",
+    "idfc": "IDFC",
+    
+    # Payments & Small Finance
+    "airtel payments bank": "AIRTEL",
+    "airtel": "AIRTEL",
+    "paytm": "PAYTM",
+    "jio payments": "JIO",
+    "au small": "AU_SFB",
+    "equitas": "EQUITAS",
 }
 
-# Channel inference: if these strings appear in narration → assign channel
+# Expanded semantic column roles to catch far more variants and formatting quirks
+GENERIC_COLUMN_ROLES = {
+    "date_col": ["date", "txn date", "tran date", "transaction date", "value date", "post date"],
+    "narration_col": ["narration", "description", "particulars", "remarks", "transaction remarks", "details", "chq / ref"],
+    "ref_col": ["reference no", "ref no", "cheque", "chq", "transaction id", "txn id", "instrument", "utr", "ref."],
+    "debit_col": ["withdrawal", "debit", "dr amount", "dr.", "dr", "amount", "paid out"],
+    "credit_col": ["deposit", "credit", "cr amount", "cr.", "cr", "paid in"],
+    "balance_col": ["balance", "closing balance", "bal.", "bal"],
+}
+
+GENERIC_MIN_REQUIRED_ROLES = 4
+
 CHANNEL_KEYWORDS = [
     ("UPI", ["upi", "gpay", "phonepe", "paytm", "bhim"]),
     ("NEFT", ["neft"]),

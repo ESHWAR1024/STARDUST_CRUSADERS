@@ -47,6 +47,11 @@ phase7/cleaned/
 *.xlsx
 *.csv
 
+#images of statements
+*.png
+*.jpg
+*.jpeg
+
 # Keep sample configs
 !requirements.txt
 !README.md
