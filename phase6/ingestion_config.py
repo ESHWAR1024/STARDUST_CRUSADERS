@@ -106,7 +106,7 @@ BANK_FORMAT_REGISTRY = {
 
 # Replace your current BANK_NAME_KEYWORDS with this expanded list
 BANK_NAME_KEYWORDS = {
-    # Top Public & Private
+    # Top Public & Private Banks
     "state bank": "SBI", "sbi": "SBI",
     "hdfc": "HDFC",
     "icici": "ICICI",
@@ -120,24 +120,82 @@ BANK_NAME_KEYWORDS = {
     "indusind": "INDUSIND",
     "yes bank": "YES",
     "idfc": "IDFC",
-    
-    # Payments & Small Finance
-    "airtel payments bank": "AIRTEL",
-    "airtel": "AIRTEL",
+    "central bank": "CBI", "cbi": "CBI",
+    "indian bank": "INDIAN",
+    "indian overseas": "IOB", "iob": "IOB",
+    "uco bank": "UCO",
+    "bank of maharashtra": "BOM",
+    "punjab & sind": "PSB",
+    "federal bank": "FEDERAL",
+    "south indian bank": "SIB",
+    "rbl bank": "RBL",
+    "bandhan": "BANDHAN",
+    "karur vysya": "KVB",
+    "city union": "CUB",
+    "jammu & kashmir": "JKB",
+    "karnataka bank": "KBL",
+    "dhanlaxmi": "DHANLAXMI",
+    "csb bank": "CSB",
+    "nainital bank": "NAINITAL",
+
+    # Foreign Banks (Major presence)
+    "standard chartered": "SCB", "stanchart": "SCB",
+    "citi": "CITI",
+    "hsbc": "HSBC",
+    "dbs": "DBS",
+    "barclays": "BARCLAYS",
+    "deutsche": "DEUTSCHE",
+
+    # Payments & Small Finance Banks (SFBs)
+    "airtel payments": "AIRTEL", "airtel": "AIRTEL",
     "paytm": "PAYTM",
     "jio payments": "JIO",
+    "india post": "IPPB", "ippb": "IPPB",
+    "fino payments": "FINO",
     "au small": "AU_SFB",
     "equitas": "EQUITAS",
-}
+    "ujjivan": "UJJIVAN",
+    "esaf": "ESAF",
+    "utkarsh": "UTKARSH",
+    "suryoday": "SURYODAY",
+    "jana small": "JANA",
+    "capital small": "CAPITAL_SFB",
+    "shivalik": "SHIVALIK",
+    "unity small": "UNITY",
 
+    # Major NBFCs (Lending, Muthoot, Bajaj, etc.)
+    "bajaj finance": "BAJAJ_FIN", "bajaj finserv": "BAJAJ_FIN",
+    "tata capital": "TATA_CAP",
+    "muthoot": "MUTHOOT",
+    "manappuram": "MANAPPURAM",
+    "shriram finance": "SHRIRAM", "shriram transport": "SHRIRAM",
+    "mahindra finance": "MAHINDRA_FIN", "m&m financial": "MAHINDRA_FIN",
+    "cholamandalam": "CHOLA",
+    "l&t finance": "LT_FIN",
+    "aditya birla capital": "AB_CAPITAL",
+    "hdb financial": "HDB_FIN",
+    "pnb housing": "PNB_HOUSING",
+    "lic housing": "LIC_HOUSING",
+    "hdfc credila": "CREDILA",
+    "poonawalla": "POONAWALLA", "magma": "POONAWALLA",
+    "iifl": "IIFL",
+    "edelweiss": "EDELWEISS",
+    "capri global": "CAPRI",
+    "piramal": "PIRAMAL",
+    "five star business": "FIVE_STAR",
+    "arohan": "AROHAN",
+    "spandana": "SPANDANA",
+    "satin creditcare": "SATIN",
+    "creditaccess": "CREDITACCESS", "grameen koota": "CREDITACCESS",
+}
 # Expanded semantic column roles to catch far more variants and formatting quirks
 GENERIC_COLUMN_ROLES = {
-    "date_col": ["date", "txn date", "tran date", "transaction date", "value date", "post date"],
-    "narration_col": ["narration", "description", "particulars", "remarks", "transaction remarks", "details", "chq / ref"],
-    "ref_col": ["reference no", "ref no", "cheque", "chq", "transaction id", "txn id", "instrument", "utr", "ref."],
-    "debit_col": ["withdrawal", "debit", "dr amount", "dr.", "dr", "amount", "paid out"],
-    "credit_col": ["deposit", "credit", "cr amount", "cr.", "cr", "paid in"],
-    "balance_col": ["balance", "closing balance", "bal.", "bal"],
+    "date_col": ["date", "txn date", "tran date", "transaction date", "value date", "post date", "posting date", "dt"],
+    "narration_col": ["narration", "description", "particulars", "remarks", "transaction remarks", "details", "chq / ref", "narrative"],
+    "ref_col": ["reference no", "ref no", "cheque", "chq", "transaction id", "txn id", "instrument", "utr", "ref.", "ref"],
+    "debit_col": ["withdrawal", "debit", "dr amount", "dr.", "dr", "amount", "paid out", "out", "withdraw"],
+    "credit_col": ["deposit", "credit", "cr amount", "cr.", "cr", "paid in", "in", "receipt"],
+    "balance_col": ["balance", "closing balance", "bal.", "bal", "running balance"],
 }
 
 GENERIC_MIN_REQUIRED_ROLES = 4

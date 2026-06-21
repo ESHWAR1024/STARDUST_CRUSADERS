@@ -183,8 +183,20 @@ def parse_date(val, date_formats: list) -> str:
     s = s.replace('O', '0').replace('o', '0')
     s = s.replace('l', '1').replace('I', '1')
 
-    # Normalise dot-separated to dash: "25.03.2025" → "25-03-2025"
-    s = re.sub(r'^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$', r'\1-\2-\3', s)
+    # Convert OCR slash misreads to standard dashes
+    s = re.sub(r'[|l\\]', '-', s)
+
+    # ── NEW: Fix Tesseract 0 -> 6 misreads in dates ─────────────
+    # If a standalone 2-digit component starts with 6 (e.g., 65, 68), 
+    # it is impossible for it to be a valid day or month. Convert to 0x.
+    s = re.sub(r'\b6(\d)\b', r'0\1', s)
+    
+    # Fix the year: 2623 -> 2023, 2624 -> 2024
+    s = re.sub(r'\b26(\d{2})\b', r'20\1', s)
+    # ────────────────────────────────────────────────────────────
+
+    # Normalise dot or space-separated to dash: "25 03 2025" -> "25-03-2025"
+    s = re.sub(r'^(\d{1,2})[\s.]+(\d{1,2})[\s.]+(\d{2,4})$', r'\1-\2-\3', s)
 
     for fmt in list(date_formats) + _EXTRA_FMTS:
         try:

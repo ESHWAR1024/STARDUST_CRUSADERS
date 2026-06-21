@@ -203,12 +203,43 @@ def normalize(
             r'(?i)\b(?:rs\.?|inr|₹|txn id|ref no)\b\s*', '', narration_raw
         ).strip()
 
+
+
+        # ── Time Rescue (Extract from Narration) ──────────────────────────
+        time_parsed = "00:00:00"
+        if narration_raw:
+            # Matches formats: 14:30:05, 14:30, 02:15 PM, 2:15PM, 14.30.05
+            tm = re.search(
+                r'\b([01]?\d|2[0-3])[:.]([0-5]\d)(?:[:.]([0-5]\d))?\s*([APap][. ]?[Mm]\.?)?\b',
+                narration_raw
+            )
+            if tm:
+                raw_t = tm.group(0)
+                try:
+                    # Convert to standard HH:MM:SS 
+                    # Replace dots with colons in case of OCR noise like 14.30.00
+                    time_parsed = pd.to_datetime(raw_t.replace('.', ':')).strftime("%H:%M:%S")
+                    
+                    # Optional: Remove the time from the narration to keep it clean
+                    narration_raw = narration_raw.replace(raw_t, "").strip()
+                except Exception:
+                    pass
+
+        if not date_parsed:
+            row_warnings.append("unparseable date")
+
+        narration_clean = re.sub(
+            r'(?i)\b(?:rs\.?|inr|₹|txn id|ref no)\b\s*', '', narration_raw
+        ).strip()
+
+
+
         output_rows.append({
             "account_id":        account_id,
             "account_holder":    account_holder,
             "bank_name":         bank_name,
             "date":              date_parsed,
-            "time":              "00:00:00",
+            "time":              time_parsed,
             "narration":         narration_clean,
             "channel":           infer_channel(narration_clean),
             "debit":             round(debit, 2),

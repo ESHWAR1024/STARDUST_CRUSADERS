@@ -21,15 +21,18 @@ import pandas as pd
 # ─────────────────────────────────────────────────────────────────────────────
 
 _AMOUNT_RE = re.compile(
-    r'(?<![,\d])\d{1,3}(?:,\d{2,3})*\.\d{2}(?![.\d])'
+    r'(?<!\d)\d{1,3}(?:[,\s]\d{2,3})*[.,]\d{2}(?!\d)'
+    r'|(?<!\d)\d{1,8}[.,]\d{2}(?!\d)'
 )
+
 _DATE4_RE = re.compile(
-    r'\d{1,2}[-/]\d{2}[-/]\d{4}'       # dd-mm-yyyy  (dash or slash)
-    r'|\d{1,2}\.\d{2}\.\d{4}'           # dd.mm.yyyy  (dot, 3 parts only)
+    r'(?<!\d)\d{1,2}\s*[-/.\s|l\\]+\s*\d{1,2}\s*[-/.\s|l\\]+\s*\d{4}(?!\d)'
+    r'|(?<!\d)\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}(?!\d)'
 )
+
 _DATE_RE = re.compile(
-    r'\d{1,2}[-/]\d{2}(?:[-/]\d{2,4})?' # dd-mm or dd-mm-yy(yy)
-    r'|\d{1,2}\.\d{2}\.\d{2,4}'          # dd.mm.yy(yy) — dot needs 3 parts
+    r'(?<!\d)\d{1,2}\s*[-/.\s|l\\]+\s*\d{1,2}(?:\s*[-/.\s|l\\]+\s*\d{2,4})?(?!\d)'
+    r'|(?<!\d)\d{1,2}\s+[A-Za-z]{3,}\s+\d{2,4}(?!\d)'
 )
 
 _NON_TX = [
@@ -290,7 +293,16 @@ def parse_image(file_path: str) -> tuple:
         return pd.DataFrame(), "", "image", [f"Preprocessing failed: {e}"]
 
     try:
-        raw_text = pytesseract.image_to_string(img, config="--psm 6 --oem 3")
+        raw_text = pytesseract.image_to_string(
+        img, 
+        config="--psm 6 --oem 3 -c preserve_interword_spaces=1"
+    )
+    
+    # ── DEBUG INJECTION: Save the raw OCR text to a file ──
+        with open("debug_ocr_output.txt", "w", encoding="utf-8") as f:
+            f.write(raw_text)
+        print("\n--- SAVED RAW OCR TO debug_ocr_output.txt ---")
+    # ──────────────────────────────────────────────────────
     except Exception as e:
         return pd.DataFrame(), "", "image", [f"OCR failed: {e}"]
 
@@ -329,10 +341,10 @@ def _preprocess(file_path: str):
                                        templateWindowSize=7,
                                        searchWindowSize=21)
     binary = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
-        blockSize=31, C=10,
-    )
+    gray, 255,
+    cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
+    blockSize=51, C=15, 
+)
     return PILImage.fromarray(binary)
 
 
@@ -346,46 +358,10 @@ def _text_line_parser(
     warnings: list,
     source: str = "image",
 ) -> pd.DataFrame:
-    """
-    Algorithm
-    ---------
-    1.  Find the table header row (≥3 column-keyword hits).
-
-    2.  Classify every subsequent line:
-          MAIN  — has both a date fragment AND a money amount
-                  → starts a new transaction block.
-          CONT  — year-only / balance-indicator-only ("R") / ≤3 chars
-                  → metadata appended to the current block.
-          OVER  — has text but no date and no amount
-                  → description overflow appended to the current block.
-          NON-TX — header/footer noise → flushes the current block.
-
-    3.  Per block:
-          a. best_date   — prefer full dd-mm-yyyy (last occurrence,
-                           because in SBI the value-date column is
-                           cleaner than the txn-date column).
-                           If only a partial date is found, inject a
-                           4-digit year from a continuation line.
-          b. description — strip dates, amounts, standalone years,
-                           single-char OCR noise, leading/trailing
-                           dash/pipe fragments.
-          c. amounts     — collect all; last = balance, rest = possible
-                           debit/credit amount.
-
-    4.  Assign debit / credit via BALANCE DELTA (curr_bal − prev_bal):
-          delta < 0  →  debit  = |delta|
-          delta > 0  →  credit =  delta
-          first row  →  keyword semantic fallback
-          delta == 0 →  keyword semantic fallback on extracted amount
-
-    5.  Return a DataFrame whose column names match the detected bank's
-        BANK_FORMAT_REGISTRY entry so normalizer.py needs zero changes.
-    """
 
     from schema_detector import detect_bank_from_text, parse_amount
     from ingestion_config import BANK_FORMAT_REGISTRY
 
-    # ── Detect bank → choose output column names ───────────────────────────
     bank_code = detect_bank_from_text(header_text) if header_text else None
     bfmt      = BANK_FORMAT_REGISTRY.get(bank_code) if bank_code else None
 
@@ -396,7 +372,6 @@ def _text_line_parser(
     cred_col  = bfmt["credit_col"]         if bfmt else "Credit"
     bal_col   = bfmt["balance_col"]        if bfmt else "Balance"
 
-    # ── Find header row (≥3 column-keyword hits) ───────────────────────────
     HDR = [
         "date", "debit", "credit", "balance", "narration", "description",
         "withdrawal", "deposit", "particulars", "remarks", "ref", "txn",
@@ -407,36 +382,35 @@ def _text_line_parser(
         if sum(1 for k in HDR if k in ln.lower()) >= 3:
             hdr_idx = i
             break
+            
     if hdr_idx is None:
         warnings.append(f"Line parser ({source}): no header found")
         return pd.DataFrame()
 
-    # ── Line classifiers ───────────────────────────────────────────────────
+    def _ocr_clean(s):
+        return s.translate(str.maketrans("OolI", "0011"))
 
-    def _has_amt(s):  return bool(_AMOUNT_RE.search(s))
-    def _has_date(s): return bool(_DATE_RE.search(s))
+    def _has_amt(s):  return bool(_AMOUNT_RE.search(_ocr_clean(s)))
+    def _has_date(s): return bool(_DATE_RE.search(_ocr_clean(s)))
     def _is_non(s):   return any(p in s.lower() for p in _NON_TX)
 
     def _is_cont(s):
         s = s.strip()
-        if not s:
-            return True
-        # balance indicator only: "R", "CR", "R|", "C R"
-        if re.match(r'^[\s|({!]*[CDRcdR]{1,2}[\s|)}\]!]*$', s):
-            return True
-        # year (+ optional indicator): "2025", "025 R", "2025 R|"
-        if re.match(
-            r'^[\s|({!\[]*\d{2,4}[\s|)}\]!]*(?:[CDRcdR][\s|)}\]!]*)?$', s
-        ):
-            return True
-        # very short, no amount, no date
+        if not s: return True
+        if re.match(r'^[\s|({!]*[CDRcdR]{1,2}[\s|)}\]!]*$', s): return True
+        if re.match(r'^[\s|({!\[]*\d{2,4}[\s|)}\]!]*(?:[CDRcdR][\s|)}\]!]*)?$', s): return True
         return len(s) <= 3 and not _has_amt(s) and not _has_date(s)
 
     def _is_main(s):
-        return (not _is_non(s) and not _is_cont(s)
-                and _has_amt(s) and _has_date(s))
+        if _is_non(s): 
+            return False
+            
+        cln = _ocr_clean(s).lstrip()
+        m = _DATE_RE.search(cln)
+        
+        # Increased to 50 to account for wide left margins or empty first columns
+        return bool(m and m.start() < 50)
 
-    # ── Group lines into transaction blocks ────────────────────────────────
     blocks, cur = [], None
     for ln in lines[hdr_idx + 1:]:
         if _is_non(ln):
@@ -450,7 +424,7 @@ def _text_line_parser(
             if cur:
                 blocks.append(cur)
             cur = [ln]
-        else:                         # description overflow
+        else:
             if cur and ln.strip():
                 cur.append(ln)
     if cur:
@@ -460,34 +434,24 @@ def _text_line_parser(
         warnings.append(f"Line parser ({source}): no transaction blocks found")
         return pd.DataFrame()
 
-    # ── Block utilities ────────────────────────────────────────────────────
-
     def _build_date(partial: str, year: str) -> str:
-        """
-        "06-05"    + "2025"  →  "06-05-2025"
-        "07-05-20" + "2025"  →  "07-05-2025"   (replaces 2-digit suffix)
-        """
-        parts = re.split(r'[-/.]', partial.strip())
+        parts = re.split(r'[-/.\s]+', partial.strip())
         if len(parts) >= 3:
             return '-'.join(parts[:2]) + '-' + year
         elif len(parts) == 2:
-            return '-'.join(parts)     + '-' + year
+            return '-'.join(parts) + '-' + year
         return partial
 
     def _best_date(blk: list) -> str:
         full, partial = [], []
         for ln in blk:
-            full    += _DATE4_RE.findall(ln)
-            partial += _DATE_RE.findall(ln)
+            cln = _ocr_clean(ln)
+            full    += _DATE4_RE.findall(cln)
+            partial += _DATE_RE.findall(cln)
         if full:
-            # Multiple full dates → take the LAST one.
-            # In SBI statements the txn-date col (first) is often garbled;
-            # the value-date col (second) is cleaner.
             return full[-1]
         if partial:
-            # Use the longest partial (rightmost column → value date)
             best = sorted(partial, key=len)[-1]
-            # Try to inject a 4-digit year from continuation lines
             for ln in blk[1:]:
                 m = re.search(r'\b(20\d{2})\b', ln)
                 if m:
@@ -497,14 +461,14 @@ def _text_line_parser(
 
     def _desc(blk: list) -> str:
         s = ' '.join(blk)
-        s = _AMOUNT_RE.sub(' ', s)               # strip amounts
-        s = _DATE4_RE.sub(' ', s)                # strip full dates
-        s = _DATE_RE.sub(' ', s)                 # strip partial dates
-        s = re.sub(r'\b20\d{2}\b', ' ', s)      # strip standalone years
-        s = re.sub(r'[|(){}\[\]~=!¢]', ' ', s)  # strip OCR bracket noise
-        s = re.sub(r'\b[A-Za-z]\b', ' ', s)     # strip single-char OCR noise
-        s = re.sub(r'^[-|\s]+', '', s)           # strip leading dash/pipe
-        s = re.sub(r'[-|\s]+$', '', s)           # strip trailing dash/pipe
+        s = _AMOUNT_RE.sub(' ', s)
+        s = _DATE4_RE.sub(' ', s)
+        s = _DATE_RE.sub(' ', s)
+        s = re.sub(r'\b20\d{2}\b', ' ', s)
+        s = re.sub(r'[|(){}\[\]~=!¢]', ' ', s)
+        s = re.sub(r'\b[A-Za-z]\b', ' ', s)
+        s = re.sub(r'^[-|\s]+', '', s)
+        s = re.sub(r'[-|\s]+$', '', s)
         return re.sub(r'\s+', ' ', s).strip().upper()
 
     def _ref(main_line: str) -> str:
@@ -513,7 +477,6 @@ def _text_line_parser(
             return m.group(1)
         return ''
 
-    # ── Extract data from each block ───────────────────────────────────────
     parsed = []
     for blk in blocks:
         all_raw  = _AMOUNT_RE.findall(' '.join(blk))
@@ -531,14 +494,12 @@ def _text_line_parser(
             "rest": rest,
         })
 
-    # ── Assign debit / credit via balance delta ────────────────────────────
     rows, prev = [], None
     for i, p in enumerate(parsed):
         bal, rest  = p["bal"], p["rest"]
         debit = credit = 0.0
 
         if prev is None or prev == 0.0:
-            # First block — semantic keyword fallback
             amt  = rest[0] if rest else 0.0
             dl   = p["desc"].lower()
             is_c = any(k in dl for k in _CREDIT_KWS)
@@ -548,19 +509,17 @@ def _text_line_parser(
             elif is_d:
                 debit = amt
             elif i + 1 < len(parsed) and parsed[i + 1]["bal"] > 0:
-                # peek at the next row's balance to decide direction
                 nxt = parsed[i + 1]["bal"]
                 if   nxt > bal: credit = amt
                 elif nxt < bal: debit  = amt
                 else:           credit = amt
             else:
-                credit = amt   # safe default
+                credit = amt
         else:
             delta = round(bal - prev, 2)
             if   delta < 0: debit  = abs(delta)
             elif delta > 0: credit = delta
             else:
-                # Balance unchanged → keyword hint on extracted amount
                 amt  = rest[0] if rest else 0.0
                 dl   = p["desc"].lower()
                 credit = amt if any(k in dl for k in _CREDIT_KWS) else 0.0
