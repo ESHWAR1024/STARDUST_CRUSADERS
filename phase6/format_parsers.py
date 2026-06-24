@@ -358,7 +358,7 @@ def _text_line_parser(
     warnings: list,
     source: str = "image",
 ) -> pd.DataFrame:
-
+    """Parse OCR/PDF text lines into a transaction table via header detection and balance-delta debit/credit inference."""
     from schema_detector import detect_bank_from_text, parse_amount
     from ingestion_config import BANK_FORMAT_REGISTRY
 
