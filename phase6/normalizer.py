@@ -216,9 +216,10 @@ def normalize(
             if tm:
                 raw_t = tm.group(0)
                 try:
-                    # Convert to standard HH:MM:SS 
-                    # Replace dots with colons in case of OCR noise like 14.30.00
-                    time_parsed = pd.to_datetime(raw_t.replace('.', ':')).strftime("%H:%M:%S")
+                    # Replace dot separators between digits (14.30.00 -> 14:30:00) but keep AM/PM tokens intact.
+                    cleaned_t = re.sub(r'(?<=\d)\.(?=\d)', ':', raw_t)
+                    cleaned_t = cleaned_t.replace('.', '')
+                    time_parsed = pd.to_datetime(cleaned_t).strftime("%H:%M:%S")
                     
                     # Optional: Remove the time from the narration to keep it clean
                     narration_raw = narration_raw.replace(raw_t, "").strip()
