@@ -1,24 +1,24 @@
 """
-Phase 6 — Normalizer
-Maps any parsed DataFrame to the UNIFIED_SCHEMA.
+Phase 6 - Normalizer
+
+Handles any financial dataset — not just bank statements.
+Uses three-tier column detection and gracefully handles:
+  - Missing balance column (computed from running totals)
+  - Single-amount column with +/- or CR/DR notation
+  - Hindi/regional language headers
+  - Completely unknown column names (Col1, A, B...)
+  - Tally, QuickBooks, ERP, court/police formats
 """
 
-import os, re
+import os
+import re
 import pandas as pd
-from ingestion_config import UNIFIED_SCHEMA, BANK_FORMAT_REGISTRY
+from ingestion_config import UNIFIED_SCHEMA
 from schema_detector import (
-    detect_bank_from_text, detect_bank_from_columns, detect_generic_format,
-    detect_header_row, parse_amount, parse_date,
+    detect_bank, find_header_row, assign_column_roles,
+    compute_running_balance, parse_date, parse_amount,
     infer_channel, extract_counterparty,
 )
-
-NON_TX_ROW_KEYWORDS = [
-    "opening balance", "closing balance", "b/f", "balance forward",
-    "total credit", "total debit", "total deposits", "total withdrawals",
-    "statement generated", "computer generated", "registered office",
-    "customer care", "this is a computer", "page ", "balance as on",
-    "brought forward", "carried forward",
-]
 
 
 def normalize(
@@ -28,180 +28,178 @@ def normalize(
     source_format: str,
     provided_account_id: str = None,
 ) -> tuple[pd.DataFrame, list]:
-
     warnings = []
 
-    if raw_df.empty:
-        return pd.DataFrame(columns=UNIFIED_SCHEMA), ["Empty input DataFrame"]
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(columns=UNIFIED_SCHEMA), ["Empty input"]
 
-    raw_df = raw_df.copy()
-    raw_df.columns = [str(c).strip() for c in raw_df.columns]
-
-    # ── Promote header if columns look unnamed ─────────────────────────────
-    current_cols = [str(c) for c in raw_df.columns]
-    looks_unheadered = all(
-        c.startswith("Unnamed:") or c.strip() == "" or c.isdigit()
-        for c in current_cols
-    )
-    if looks_unheadered:
-        hi = detect_header_row(raw_df)
-        raw_df = raw_df.iloc[hi + 1:].copy()
-        raw_df.columns = [str(c).strip() for c in raw_df.iloc[hi].values
-                          if pd.notna(c)]  # already sliced above, use detected
-        raw_df = raw_df.reset_index(drop=True)
-
-    # ── Detect bank format (4 fallback levels) ─────────────────────────────
-    bank_code = detect_bank_from_text(header_text)
-    bank_fmt  = BANK_FORMAT_REGISTRY.get(bank_code) if bank_code else None
-
-    # Level 1 — header text matched, but validate columns exist
-    if bank_fmt is not None:
-        required = {
-            bank_fmt["date_col"], bank_fmt["narration_col"],
-            bank_fmt["debit_col"], bank_fmt["credit_col"], bank_fmt["balance_col"],
-        }
-        if len(required & set(raw_df.columns)) < 3:
-            bank_fmt = None
-
-    # Level 2 — column-name exact match
-    if bank_fmt is None:
-        detected, col_fmt = detect_bank_from_columns(raw_df.columns.tolist())
-        if col_fmt:
-            bank_code, bank_fmt = detected, col_fmt
-
-    # Level 3 — re-scan for header row deeper in the data
-    if bank_fmt is None:
-        hi = detect_header_row(raw_df)
-        if hi > 0:
-            new_cols = raw_df.iloc[hi].values
-            raw_df   = raw_df.iloc[hi + 1:].copy()
-            raw_df.columns = [str(c).strip() for c in new_cols]
-            raw_df   = raw_df.reset_index(drop=True)
-            detected, col_fmt = detect_bank_from_columns(raw_df.columns.tolist())
-            if col_fmt:
-                bank_code, bank_fmt = detected, col_fmt
-
-    # Level 4 — generic role matching
-    if bank_fmt is None:
-        bank_fmt = detect_generic_format(raw_df.columns.tolist())
-        if bank_fmt is not None:
-            if bank_code and bank_code not in BANK_FORMAT_REGISTRY:
-                bank_fmt["bank_name"] = bank_code.title()
-                warnings.append(f"Unlisted bank '{bank_code}' — generic column match")
-            else:
-                warnings.append("Bank not in registry — used generic column match")
-
-    if bank_fmt is None:
-        warnings.append("Could not detect bank format — skipping file")
-        return pd.DataFrame(columns=UNIFIED_SCHEMA), warnings
-
-    bank_name      = bank_fmt.get("bank_name", "Unknown / Generic")
-    account_holder = _extract_account_holder(header_text)
-    account_id     = provided_account_id or _extract_account_id(source_file)
+    # -----------------------------------------------------------------------
+    # Step 1: Find real header row
+    # OCR (image) sources skip this — the OCR bbox parser already handles
+    # header detection. Running find_header_row on garbled OCR column names
+    # makes things worse, not better.
+    # -----------------------------------------------------------------------
+    if source_format not in ("image",):
+        header_row_idx = find_header_row(raw_df)
+        if header_row_idx > 0:
+            new_cols = [str(v).strip() for v in raw_df.iloc[header_row_idx].values]
+            raw_df = raw_df.iloc[header_row_idx + 1:].copy()
+            raw_df.columns = new_cols
+            raw_df = raw_df.reset_index(drop=True)
 
     raw_df = raw_df.dropna(how="all").reset_index(drop=True)
+    raw_df = raw_df.loc[:, raw_df.notna().any()]
 
-    # Collect date-like fallback columns (for when primary date_col is garbled)
-    date_fallback_cols = [
-        c for c in raw_df.columns
-        if c != bank_fmt.get("date_col", "")
-        and any(kw in str(c).lower() for kw in ["date", "value", "post", "tran"])
-    ]
+    if raw_df.empty:
+        return pd.DataFrame(columns=UNIFIED_SCHEMA), ["No data rows after header detection"]
 
+    # -----------------------------------------------------------------------
+    # Step 2: Detect bank name
+    # -----------------------------------------------------------------------
+    bank_name, bank_detection_method = detect_bank(header_text)
+    if bank_name == "Unknown Bank":
+        bank_name, bank_detection_method = detect_bank(os.path.basename(source_file))
+
+    # -----------------------------------------------------------------------
+    # Step 3: Three-tier column role assignment
+    # -----------------------------------------------------------------------
+    try:
+        roles = assign_column_roles(raw_df.columns.tolist(), df=raw_df)
+    except Exception as e:
+        warnings.append(f"Column role detection error: {e} — attempting keyword-only fallback")
+        try:
+            from schema_detector import assign_column_roles_by_keywords
+            roles = assign_column_roles_by_keywords(raw_df.columns.tolist())
+        except Exception:
+            return pd.DataFrame(columns=UNIFIED_SCHEMA), warnings + ["Column detection failed completely"]
+
+    # -----------------------------------------------------------------------
+    # Step 3b: Validate date column — OCR often splits "Post Date" into
+    # "Post" + "Date" columns. Pick the column with actual date values.
+    # -----------------------------------------------------------------------
+    date_col = roles.get("date")
+    if date_col:
+        from schema_detector import parse_date as _parse_date
+        sample = raw_df[date_col].dropna().astype(str).head(10)
+        date_hits = sum(1 for v in sample if _parse_date(v) and not _parse_date(v) == v)
+        if date_hits < 2:
+            # Try all other columns to find one with actual date content
+            for col in raw_df.columns:
+                if col == date_col:
+                    continue
+                s = raw_df[col].dropna().astype(str).head(10)
+                hits = sum(1 for v in s if _parse_date(v) and not _parse_date(v) == v)
+                if hits > date_hits:
+                    date_hits = hits
+                    date_col = col
+            roles["date"] = date_col
+
+    # Log what was detected
+    warnings.append(
+        f"Bank: {bank_name} (via {bank_detection_method}) | "
+        f"date={roles.get('date')} | narration={roles.get('narration')} | "
+        f"debit={roles.get('debit') or roles.get('amount')} | "
+        f"credit={roles.get('credit') or roles.get('amount')} | "
+        f"balance={roles.get('balance')}"
+    )
+
+    # Critical check: need at least a date column
+    if not roles.get("date"):
+        warnings.append(f"CRITICAL: Could not identify date column. Columns: {raw_df.columns.tolist()}")
+        return pd.DataFrame(columns=UNIFIED_SCHEMA), warnings
+
+    # -----------------------------------------------------------------------
+    # Step 4: Compute balance if missing
+    # -----------------------------------------------------------------------
+    balance_col = roles.get("balance")
+    balance_computed = False
+    if not balance_col:
+        debit_c  = roles.get("debit")  or roles.get("amount")
+        credit_c = roles.get("credit") or roles.get("amount")
+        if debit_c and credit_c:
+            raw_df["_computed_balance"] = compute_running_balance(
+                raw_df, debit_c, credit_c, start_balance=0.0
+            )
+            balance_col = "_computed_balance"
+            balance_computed = True
+            warnings.append("Balance column not found — computed from running debit/credit totals")
+
+    # -----------------------------------------------------------------------
+    # Step 5: Metadata
+    # -----------------------------------------------------------------------
+    account_holder = _extract_account_holder(header_text)
+    account_id = (
+        provided_account_id
+        or _extract_account_id_from_text(header_text)
+        or _extract_account_id_from_filename(source_file)
+    )
+
+    # -----------------------------------------------------------------------
+    # Step 6: Row-by-row normalization
+    # -----------------------------------------------------------------------
     output_rows = []
+    skipped = 0
 
     for _, row in raw_df.iterrows():
-        row_warnings = []
 
-        # Skip non-transaction rows (summaries, footers)
-        row_text = " ".join(
-            str(_get_col(row, c) or "")
-            for c in [bank_fmt.get("date_col", ""), bank_fmt.get("narration_col", "")]
-        ).lower()
-        if any(kw in row_text for kw in NON_TX_ROW_KEYWORDS):
+        # Date — skip rows with no parseable date
+        date_str = parse_date(_get(row, roles.get("date")))
+        if not date_str:
+            skipped += 1
             continue
 
-        narration_raw = str(
-            _get_col(row, bank_fmt.get("narration_col", "")) or ""
-        ).strip()
+        # Narration — if no narration column was identified, fall back to
+        # concatenating whatever unmapped columns this row has, rather
+        # than leaving every transaction's narration blank.
+        narration = str(_get(row, roles.get("narration")) or "").strip()
+        if not narration:
+            narration = _build_narration_from_unmapped(row, roles)
+        narration = narration.upper()
 
-        # ── Date (3 levels) ───────────────────────────────────────────────
-        date_raw    = _get_col(row, bank_fmt.get("date_col", ""))
-        date_parsed = parse_date(date_raw, bank_fmt.get("date_formats", []))
+        # Amounts
+        debit, credit = 0.0, 0.0
 
-        # Fallback: try other date-like columns (e.g. "Value Date" when
-        #           "Txn Date" was garbled by OCR)
-        if not date_parsed:
-            for fb_col in date_fallback_cols:
-                fb_date = parse_date(
-                    _get_col(row, fb_col), bank_fmt.get("date_formats", [])
-                )
-                if fb_date:
-                    date_parsed = fb_date
-                    row_warnings.append(f"date from '{fb_col}'")
-                    break
+        if roles.get("debit") and roles.get("credit"):
+            # Standard two-column format
+            debit,  d_sign = parse_amount(_get(row, roles["debit"]))
+            credit, c_sign = parse_amount(_get(row, roles["credit"]))
+            # If debit column had CR sign, it's actually a credit reversal
+            if d_sign == "+":
+                credit, debit = debit, 0.0
+            if c_sign == "-":
+                debit, credit = credit, 0.0
 
-        # Rescue: date embedded in the narration text
-        if not date_parsed and narration_raw:
-            dm = re.search(
-                r'\b\d{1,2}[-/\.\s]+[A-Za-z]{3,}(?:\s*,?\s*\d{4})?\b'
-                r'|\b\d{1,2}[-/.]\d{1,2}(?:[-/.]\d{2,4})?\b',
-                narration_raw,
-            )
-            if dm:
-                extracted = dm.group(0).replace(",", "").strip()
-                if len(extracted) <= 7 and not re.search(r'\d{4}', extracted):
-                    extracted += " 2024"
-                rescue_fmts = (
-                    bank_fmt.get("date_formats", []) +
-                    ["%d %b %Y", "%d %b %y", "%d/%m/%Y", "%d-%m-%Y"]
-                )
-                rescued = parse_date(extracted, rescue_fmts)
-                if rescued:
-                    date_parsed   = rescued
-                    narration_raw = narration_raw.replace(dm.group(0), "").strip()
-                    row_warnings.append("date rescued from narration")
+        elif roles.get("amount"):
+            # Single amount column
+            amt, sign = parse_amount(_get(row, roles["amount"]))
+            if sign == "+":
+                credit = amt
+            elif sign == "-":
+                debit = amt
+            else:
+                # Infer from narration context
+                nar_lower = narration.lower()
+                if any(w in nar_lower for w in [
+                    "cr-", " cr ", "credit", "deposit", "received",
+                    "salary", "refund", "cashback", "interest credit",
+                ]):
+                    credit = amt
+                else:
+                    debit = amt
 
-        # ── Amounts ───────────────────────────────────────────────────────
-        debit   = parse_amount(_get_col(row, bank_fmt.get("debit_col",   "")))
-        credit  = parse_amount(_get_col(row, bank_fmt.get("credit_col",  "")))
-        balance = parse_amount(_get_col(row, bank_fmt.get("balance_col", "")))
+        # Balance
+        balance = 0.0
+        if balance_col:
+            b, _ = parse_amount(_get(row, balance_col))
+            balance = b
 
-        # Rescue: amounts embedded in narration when both columns are zero
-        if debit == 0.0 and credit == 0.0 and narration_raw:
-            am = re.search(
-                r'(?:₹|rs\.?|inr)?[\s]*(\d+(?:,\d+)*\.\d{2})\b',
-                narration_raw, re.IGNORECASE,
-            )
-            if am:
-                rescued_amt   = float(am.group(1).replace(",", ""))
-                is_credit_kw  = any(
-                    kw in narration_raw.lower()
-                    for kw in ["received", "added", "credited", "+", "refund"]
-                )
-                credit        = rescued_amt if is_credit_kw else 0.0
-                debit         = 0.0         if is_credit_kw else rescued_amt
-                narration_raw = narration_raw.replace(am.group(0), "").strip()
-                row_warnings.append("amount rescued from narration")
+        # Skip pure zero rows (header repeats, subtotal rows)
+        if debit == 0.0 and credit == 0.0 and balance == 0.0:
+            skipped += 1
+            continue
 
-        # ── Ref / UTR ─────────────────────────────────────────────────────
-        utr_ref = str(_get_col(row, bank_fmt.get("ref_col", "")) or "").strip()
-        if utr_ref.lower() in ("nan", "none", "null", ""):
-            um = re.search(
-                r'\b(?:txn|ref|id|utr)?[\s:-]*([A-Za-z0-9]{8,22})\b',
-                narration_raw, re.IGNORECASE,
-            )
-            if um:
-                c = um.group(1)
-                if any(ch.isdigit() for ch in c) and len(c) >= 8:
-                    utr_ref = c
-
-        if not date_parsed:
-            row_warnings.append("unparseable date")
-
-        narration_clean = re.sub(
-            r'(?i)\b(?:rs\.?|inr|₹|txn id|ref no)\b\s*', '', narration_raw
-        ).strip()
+        utr_ref = str(_get(row, roles.get("ref")) or "").strip()
+        time_str = _extract_time(row, roles)
 
 
 
@@ -247,70 +245,115 @@ def normalize(
             "credit":            round(credit, 2),
             "balance":           round(balance, 2),
             "utr_ref":           utr_ref,
-            "counterparty_name": extract_counterparty(narration_clean),
+            "counterparty_name": extract_counterparty(narration),
             "source_file":       os.path.basename(source_file),
             "source_format":     source_format,
-            "ingestion_warnings": " | ".join(row_warnings) if row_warnings else "",
+            "ingestion_warnings": "balance_computed" if balance_computed else "",
         })
 
-    normalized = pd.DataFrame(output_rows, columns=UNIFIED_SCHEMA)
+    if skipped:
+        warnings.append(f"Skipped {skipped} non-transaction rows")
 
-    # ── Drop rows that have NO date AND NO monetary amounts ───────────────
-    # (less aggressive than the original OR condition — a row with valid
-    #  amounts but a garbled date is still useful for investigators)
-    before = len(normalized)
-    normalized = normalized[
-        ~(
-            (normalized["date"]   == "")  &
-            (normalized["debit"]  == 0.0) &
-            (normalized["credit"] == 0.0)
-        )
-    ].reset_index(drop=True)
-    dropped = before - len(normalized)
-    if dropped:
-        warnings.append(f"Dropped {dropped} junk rows (no date AND no amounts)")
+    if not output_rows:
+        warnings.append("No transaction rows could be extracted")
+        return pd.DataFrame(columns=UNIFIED_SCHEMA), warnings
 
-    warnings = _count_row_warnings(normalized, warnings)
-    return normalized, warnings
+    return pd.DataFrame(output_rows, columns=UNIFIED_SCHEMA), warnings
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _get_col(row, col_name: str):
+def _get(row, col_name):
+    if not col_name:
+        return None
     try:
         val = row[col_name]
-        return None if pd.isna(val) else val
+        return None if (isinstance(val, float) and pd.isna(val)) else val
     except (KeyError, TypeError):
         return None
 
 
-def _extract_account_holder(header_text: str) -> str:
-    patterns = [
-        r"Account\s+(?:Holder|Name)\s*[:\s]+([A-Za-z\s\.]{3,39})"
-        r"(?:\n|IFSC|Account|$)",
-        r"Customer\s+Name\s*[:\s]+([A-Za-z\s\.]{3,39})(?:\n|$)",
-        r"Statement\s+of\s*[:\s]+([A-Za-z\s\.]{3,39})(?:\n|$)",
-        r"Hello,\s*([A-Za-z\s\.]{3,39})(?:\n|$)",
-        r"Name\s*[:\s]+([A-Za-z\s\.]{3,39})(?:\n|$)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, header_text, re.IGNORECASE)
+def _build_narration_from_unmapped(row, roles: dict) -> str:
+    """
+    Fallback when no narration column was identified: concatenate
+    whatever columns this row has that weren't already mapped to a known
+    role, so a transaction's narration is never silently left blank just
+    because the file's narration column had an unrecognized header name.
+    """
+    mapped = {col for col in roles.values() if col}
+    parts = []
+    for col, val in row.items():
+        if col in mapped or pd.isna(val):
+            continue
+        text = str(val).strip()
+        if text and text.lower() not in ("nan", "none"):
+            parts.append(text)
+    return " ".join(parts[:4])
+
+
+def _extract_time(row, roles: dict) -> str:
+    """
+    Pull a real HH:MM:SS out of a dedicated time/timestamp column, or out
+    of the date column itself if it embeds a time component (e.g.
+    "2026-01-15 14:32:00"). Falls back to "00:00:00" only if neither
+    yields anything - most formats genuinely have no time information,
+    but plenty do and shouldn't be flattened to midnight.
+    """
+    for col in row.index:
+        col_lower = str(col).lower()
+        if "time" not in col_lower and "timestamp" not in col_lower:
+            continue
+        val = _get(row, col)
+        if not val:
+            continue
+        m = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", str(val))
         if m:
-            c = m.group(1).strip()
-            if 3 <= len(c) < 40:
-                return c
+            hour, minute, second = m.group(1), m.group(2), m.group(3) or "00"
+            return f"{int(hour):02d}:{minute}:{second}"
+
+    date_val = _get(row, roles.get("date"))
+    m = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", str(date_val or ""))
+    if m:
+        hour, minute, second = m.group(1), m.group(2), m.group(3) or "00"
+        return f"{int(hour):02d}:{minute}:{second}"
+    return "00:00:00"
+
+
+def _extract_account_holder(text: str) -> str:
+    if not text:
+        return ""
+    patterns = [
+        r"(?:account holder|account name|name|customer)[:\s]+([A-Za-z][A-Za-z\s\.]{2,40}?)(?:\n|$|account|ifsc)",
+    ]
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip().title()
     return ""
 
 
-def _extract_account_id(filename: str) -> str:
-    m = re.search(r'(ACC\d+)', os.path.basename(filename))
+def _extract_account_id_from_text(text: str) -> str:
+    """
+    Pull the actual account number out of the statement header text
+    (e.g. "Account Number: 14729595422743"), checked BEFORE falling back
+    to the filename. Most real statements carry the account number
+    somewhere in their header; relying on the filename alone misses that
+    whenever the file is named something generic like "statement.csv".
+    """
+    if not text:
+        return ""
+    patterns = [
+        r"(?:account\s*(?:no|number|id)|a/c\s*(?:no|number)|acct\s*(?:no|number))\s*[:\-]?\s*([A-Z0-9X*]{6,24})",
+        r"\b(\d{9,18})\b",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return re.sub(r"[^A-Za-z0-9X*]", "", m.group(1))[:24]
+    return ""
+
+
+def _extract_account_id_from_filename(filename: str) -> str:
+    m = re.search(r"(ACC\d+)", os.path.basename(filename))
     if m:
         return m.group(1)
-    return os.path.splitext(os.path.basename(filename))[0]
-
-
-def _count_row_warnings(df: pd.DataFrame, existing: list) -> list:
-    n = (df["ingestion_warnings"] != "").sum()
-    if n:
-        existing.append(f"{n} rows had parsing warnings")
-    return existing
+    return re.sub(r"[^A-Za-z0-9_]", "_",
+                  os.path.splitext(os.path.basename(filename))[0])[:20]

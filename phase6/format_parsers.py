@@ -1,9 +1,18 @@
 """
-Phase 6 — Format-specific parsers
-Supports: CSV, XLSX, PDF (pdfplumber), Image (Tesseract + OpenCV)
+Phase 6 - Format-specific parsers
+
+Each parser takes a file path and returns:
+  (raw_df, header_text, source_format, warnings)
+
+- raw_df      : DataFrame with raw content (pre-normalization)
+- header_text : free text from the file header (bank name, account info)
+- source_format: "csv" | "xlsx" | "pdf" | "image"
+- warnings    : list of issues encountered during parsing
 """
 
-import os, re
+import io
+import os
+import re
 import numpy as np
 import pandas as pd
 
@@ -57,260 +66,394 @@ _DEBIT_KWS = [
 # CSV
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ---------------------------------------------------------------------------
+# CSV Parser
+# ---------------------------------------------------------------------------
 def parse_csv(file_path: str) -> tuple:
     warnings = []
     header_text = ""
 
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            raw_lines = [f.readline() for _ in range(12)]
-        header_text = "".join(raw_lines)
+            raw_lines = [f.readline() for _ in range(8)]
+        header_text = " ".join(raw_lines)
     except Exception as e:
-        warnings.append(f"Header read error: {e}")
+        warnings.append(f"Could not read header lines: {e}")
 
-    from ingestion_config import BANK_FORMAT_REGISTRY
-    kws = set()
-    for fmt in BANK_FORMAT_REGISTRY.values():
-        kws.update([fmt["date_col"], fmt["narration_col"],
-                    fmt["debit_col"], fmt["credit_col"], fmt["balance_col"]])
+    # Find the real header row by scanning for known column keywords
+    from ingestion_config import COLUMN_ROLE_KEYWORDS
+    all_col_keywords = set()
+    for keywords in COLUMN_ROLE_KEYWORDS.values():
+        all_col_keywords.update(keywords)
 
     skip = 0
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             for i, line in enumerate(f):
-                if sum(1 for k in kws if k.lower() in line.lower()) >= 3:
+                # Count how many known column names appear in this line
+                hits = sum(1 for kw in all_col_keywords if kw.lower() in line.lower())
+                if hits >= 3:
                     skip = i
                     break
     except Exception:
         pass
 
     df = None
-    for enc in ("utf-8", "latin-1", "cp1252"):
+    for encoding in ("utf-8", "latin-1", "cp1252"):
         try:
-            c = pd.read_csv(
-                file_path, encoding=enc, skiprows=skip,
-                skip_blank_lines=True, dtype=str, on_bad_lines="skip",
+            df = pd.read_csv(
+                file_path,
+                encoding=encoding,
+                skiprows=skip,
+                skip_blank_lines=True,
+                dtype=str,
+                on_bad_lines="skip",
             )
-            if len(c.columns) >= 4:
-                df = c
+            if len(df.columns) >= 4:
                 break
-        except Exception:
+        except Exception as e:
+            warnings.append(f"CSV read error (enc={encoding}): {e}")
             continue
 
     if df is None or df.empty:
         warnings.append("CSV parsing failed entirely")
         return pd.DataFrame(), header_text, "csv", warnings
 
-    df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
     return df, header_text, "csv", warnings
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# XLSX
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ---------------------------------------------------------------------------
+# Excel Parser
+# ---------------------------------------------------------------------------
 def parse_xlsx(file_path: str) -> tuple:
     warnings = []
     header_text = ""
 
     try:
-        raw = pd.read_excel(file_path, header=None, dtype=str, nrows=8)
+        # Read raw with no header to capture bank metadata rows
+        raw = pd.read_excel(file_path, header=None, dtype=str, nrows=6)
         header_text = " ".join(
             str(v) for row in raw.values for v in row if pd.notna(v)
         )
     except Exception as e:
-        warnings.append(f"Excel header read error: {e}")
+        warnings.append(f"Could not read Excel header block: {e}")
 
+    # Read with header starting at different rows
     df = None
-    for hr in range(6):
+    for header_row in (0, 1, 2, 3, 4):
         try:
-            c = pd.read_excel(file_path, header=hr, dtype=str, engine="openpyxl")
-            if len(c.columns) >= 4 and not all(
-                str(col).startswith("Unnamed") for col in c.columns
-            ):
-                df = c
+            df = pd.read_excel(
+                file_path,
+                header=header_row,
+                dtype=str,
+                engine="openpyxl",
+            )
+            if len(df.columns) >= 4 and not all(str(c).startswith("Unnamed") for c in df.columns):
                 break
-        except Exception:
+        except Exception as e:
+            warnings.append(f"Excel read failed at header_row={header_row}: {e}")
             continue
 
     if df is None:
         warnings.append("Excel parsing failed entirely")
         return pd.DataFrame(), header_text, "xlsx", warnings
 
-    df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
     return df, header_text, "xlsx", warnings
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# PDF
-# ═══════════════════════════════════════════════════════════════════════════
-
-def parse_pdf(file_path: str) -> tuple:
+# ---------------------------------------------------------------------------
+# PDF Parser (pdfplumber - handles text-layer PDFs)
+# ---------------------------------------------------------------------------
+def parse_pdf(file_path: str, password: str = None, password_candidates: list = None) -> tuple:
+    """
+    password: a single password to try if the PDF turns out to be
+    encrypted.
+    password_candidates: an optional list of passwords to try in order
+    (useful for investigators who have a few likely candidates - DOB,
+    PAN, account-number-based formulas banks commonly use - rather than
+    one confirmed password). `password`, if given, is tried first.
+    """
     try:
         import pdfplumber
+        from pdfplumber.utils.exceptions import PdfminerException
     except ImportError:
         return pd.DataFrame(), "", "pdf", ["pdfplumber not installed"]
 
     warnings = []
     header_text = ""
-    all_rows, headers, n_cols = [], None, 0
+    all_rows = []
+    headers = None
+
+    candidates = ([password] if password else []) + list(password_candidates or [])
+
+    def _open_pdf():
+        """
+        Try opening unprotected first (the common case), then each
+        candidate password in order. Raises the LAST encryption-related
+        exception if every attempt fails, so the caller can distinguish
+        "this PDF is password-protected and none of the supplied
+        passwords worked" from any other kind of parsing failure.
+        """
+        try:
+            return pdfplumber.open(file_path)
+        except PdfminerException as e:
+            if not candidates:
+                raise PdfminerException(
+                    "PDF appears to be password-protected. Re-run with "
+                    "--pdf-password (or --pdf-passwords for multiple "
+                    "candidates) to supply one."
+                ) from e
+            last_err = e
+            for pw in candidates:
+                try:
+                    return pdfplumber.open(file_path, password=pw)
+                except PdfminerException as e2:
+                    last_err = e2
+                    continue
+            raise PdfminerException(
+                f"PDF is password-protected and none of the "
+                f"{len(candidates)} supplied password(s) worked."
+            ) from last_err
 
     try:
-        with pdfplumber.open(file_path) as pdf:
-            for pnum, page in enumerate(pdf.pages):
-                if pnum == 0:
-                    header_text = (page.extract_text() or "")[:800]
+        with _open_pdf() as pdf:
+            full_text_chunks = []
+            for page_num, page in enumerate(pdf.pages):
+                # Accumulate text from EVERY page for bank detection, not
+                # just a narrow slice of page 1. Safety against picking up
+                # a counterparty's bank instead of the statement's own
+                # comes from detect_bank()'s anchoring (an explicit "IFSC"
+                # label for the IFSC-lookup path, earliest-occurrence
+                # preference for the keyword-name fallback path) — not
+                # from artificially restricting how much text is searched.
+                page_text = page.extract_text() or ""
+                if page_text:
+                    full_text_chunks.append(page_text)
+            header_text = "\n".join(full_text_chunks)
 
-                tables = None
-                for strat in (
-                    {"vertical_strategy": "lines", "horizontal_strategy": "lines",
-                     "snap_tolerance": 3, "join_tolerance": 3},
-                    {},
-                ):
-                    tables = (page.extract_tables(strat)
-                              if strat else page.extract_tables())
-                    if tables:
-                        break
+            for page_num, page in enumerate(pdf.pages):
+                # Extract tables with explicit settings for better accuracy
+                tables = page.extract_tables({
+                    "vertical_strategy": "lines",
+                    "horizontal_strategy": "lines",
+                    "snap_tolerance": 3,
+                    "join_tolerance": 3,
+                })
 
-                for table in (tables or []):
-                    if not table or len(table) < 2 or not _is_tx_table(table):
+                if not tables:
+                    # Fallback: try default extraction
+                    tables = page.extract_tables()
+
+                for table in tables:
+                    if not table:
                         continue
-                    cleaned = [
-                        [str(c).strip() if c else "" for c in row]
-                        for row in table if any(c for c in row)
-                    ]
+                    # Need at least 2 rows (header + 1 data row) only when
+                    # we're still LOOKING for the table that has the
+                    # header. Once headers is already established, a
+                    # continuation page can legitimately have just 1 data
+                    # row and no header of its own - rejecting it here
+                    # would (and did) drop short continuation pages.
+                    if headers is None and len(table) < 2:
+                        continue
+
+                    # Once the real transaction table is already found on
+                    # an earlier page, a later page's table is a
+                    # CONTINUATION of it - it won't repeat the header row,
+                    # so re-validating its row 0 against header keywords
+                    # rejected every page after the first. Accept it as a
+                    # continuation purely by column count instead.
+                    if headers is not None:
+                        if len(table[0]) != n_cols:
+                            continue
+                    elif not _is_transaction_table(table):
+                        continue
+
+                    # Clean table: strip whitespace, replace None with ""
+                    cleaned = []
+                    for row in table:
+                        clean_row = [
+                            str(cell).strip() if cell is not None else ""
+                            for cell in row
+                        ]
+                        if any(c for c in clean_row):
+                            cleaned.append(clean_row)
+
                     if not cleaned:
                         continue
-                    if headers is None:
-                        hi = _find_hdr(cleaned)
-                        headers = _merge_hdrs(cleaned[hi])
-                        n_cols = len(headers)
-                        data = cleaned[hi + 1:]
-                    else:
-                        data = cleaned
-                        if _merge_hdrs(cleaned[0]) == headers:
-                            data = cleaned[1:]
-                    for row in data:
-                        all_rows.append((row + [""] * n_cols)[:n_cols])
 
+                    if headers is None:
+                        header_row_idx = _find_pdf_header_row(cleaned)
+                        raw_headers = cleaned[header_row_idx]
+                        # Merge adjacent cells that are continuation of a split header
+                        # e.g. ["Ref No./Cheque No", ". Debit"] → keep as separate cols
+                        # but fix obvious splits where cell starts with ". " or "/ "
+                        headers = _merge_split_headers(raw_headers)
+                        n_cols = len(headers)
+                        data_rows = cleaned[header_row_idx + 1:]
+                    else:
+                        data_rows = cleaned
+                        if cleaned[0] == headers or _merge_split_headers(cleaned[0]) == headers:
+                            data_rows = cleaned[1:]
+
+                    for row in data_rows:
+                        if len(row) < n_cols:
+                            row += [""] * (n_cols - len(row))
+                        all_rows.append(row[:n_cols])
+
+    except PdfminerException as e:
+        return pd.DataFrame(), header_text, "pdf", [f"PASSWORD_PROTECTED: {e}"]
     except Exception as e:
-        return pd.DataFrame(), header_text, "pdf", [f"PDF error: {e}"]
+        return pd.DataFrame(), header_text, "pdf", [f"PDF parsing error: {e}"]
 
     if not all_rows or headers is None:
-        warnings.append("No tables found — trying text fallback")
+        warnings.append("No tables found in PDF — trying text fallback")
         return _pdf_text_fallback(file_path, header_text, warnings)
 
-    df = pd.DataFrame(all_rows, columns=headers).replace("", pd.NA)
-    warnings.append(f"PDF table: {len(df)} rows, {len(headers)} cols")
+    df = pd.DataFrame(all_rows, columns=headers)
+    # Replace empty strings with NaN for downstream compatibility
+    df = df.replace("", pd.NA)
+    warnings.append(f"PDF: extracted {len(df)} rows, {len(headers)} columns")
+
     return df, header_text, "pdf", warnings
 
 
-def _is_tx_table(t):
-    if not t or len(t) < 2 or len(t[0]) < 4:
-        return False
-    h = " ".join(str(c).lower() for c in t[0])
-    return (
-        any(w in h for w in ("date", "txn", "tran", "post")) and
-        any(w in h for w in ("debit", "credit", "balance",
-                             "withdrawal", "deposit", "amount"))
-    )
-
-
-def _find_hdr(rows):
-    from ingestion_config import BANK_FORMAT_REGISTRY
-    kws = set()
-    for fmt in BANK_FORMAT_REGISTRY.values():
-        kws.update([fmt["date_col"].lower(), fmt["narration_col"].lower(),
-                    fmt["debit_col"].lower(), fmt["credit_col"].lower(),
-                    fmt["balance_col"].lower()])
-    best_i, best_s = 0, 0
-    for i, row in enumerate(rows[:8]):
-        s = sum(1 for c in row if any(k in str(c).lower() for k in kws))
-        if s > best_s:
-            best_s, best_i = s, i
-    return best_i
-
-
-def _merge_hdrs(hdrs):
-    out, skip = [], False
-    for i, cell in enumerate(hdrs):
-        if skip:
-            skip = False
+def _merge_split_headers(headers: list) -> list:
+    """
+    pdfplumber sometimes splits a single header cell across two columns
+    when a line break falls inside a cell (e.g. "Ref No./Cheque No" + ". Debit").
+    Merge cells where the next cell starts with punctuation or lowercase.
+    """
+    merged = []
+    skip_next = False
+    for i, cell in enumerate(headers):
+        if skip_next:
+            skip_next = False
             continue
         cell = str(cell).strip()
-        if i + 1 < len(hdrs):
-            nxt = str(hdrs[i + 1]).strip()
-            if nxt and nxt[0] in (".", ",", "/") and len(nxt) < 14:
-                out.append(cell + nxt)
-                skip = True
+        if i + 1 < len(headers):
+            next_cell = str(headers[i + 1]).strip()
+            # Merge if next cell starts with punctuation or is a continuation fragment
+            if next_cell and next_cell[0] in (".", ",", "/", " ") and len(next_cell) < 10:
+                merged.append((cell + next_cell).strip())
+                skip_next = True
                 continue
-        out.append(cell)
-    return out
+        merged.append(cell)
+    return merged
 
 
-def _pdf_text_fallback(file_path, header_text, warnings):
+def _find_pdf_header_row(rows: list) -> int:
+    """Find which row index contains the actual column headers."""
+    from ingestion_config import COLUMN_ROLE_KEYWORDS
+    all_col_keywords = set()
+    for kws in COLUMN_ROLE_KEYWORDS.values():
+        all_col_keywords.update(kw.lower() for kw in kws)
+
+    best_idx = 0
+    best_score = 0
+    for i, row in enumerate(rows[:6]):
+        score = sum(
+            1 for cell in row
+            if any(kw in str(cell).lower() for kw in all_col_keywords)
+        )
+        if score > best_score:
+            best_score = score
+            best_idx = i
+    return best_idx
+
+
+def _is_transaction_table(table: list) -> bool:
+    """
+    Return True only if this table looks like a transaction table
+    (has date + amount columns), not an account info block.
+    """
+    if not table or len(table) < 2:
+        return False
+    # Must have at least 5 columns (date, narration, ref, debit/credit, balance)
+    if len(table[0]) < 5:
+        return False
+    # Header row must contain at least one date/amount keyword
+    header_text = " ".join(str(c).lower() for c in table[0])
+    date_keywords = {"date", "txn", "tran", "post"}
+    amount_keywords = {"debit", "credit", "withdrawal", "deposit", "balance", "amount"}
+    has_date = any(kw in header_text for kw in date_keywords)
+    has_amount = any(kw in header_text for kw in amount_keywords)
+    return has_date and has_amount
+
+
+def _pdf_text_fallback(file_path: str, header_text: str, warnings: list) -> tuple:
+    """
+    Last resort for PDFs where table extraction fails completely:
+    extract all text and try to parse line by line.
+    """
     try:
         import pdfplumber
-        lines = []
+        all_lines = []
         with pdfplumber.open(file_path) as pdf:
             for page in pdf.pages:
-                lines.extend(
-                    (page.extract_text(x_tolerance=2, y_tolerance=2) or "")
-                    .splitlines()
-                )
-        df = _text_line_parser(lines, header_text, warnings, source="pdf")
-        warnings.append("PDF: used text-line fallback")
+                text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
+                all_lines.extend(text.splitlines())
+        df = _ocr_text_to_dataframe(all_lines, warnings)
+        warnings.append("PDF: used text-line fallback (table extraction failed)")
         return df, header_text, "pdf", warnings
     except Exception as e:
-        return (pd.DataFrame(), header_text, "pdf",
-                warnings + [f"PDF fallback failed: {e}"])
+        return pd.DataFrame(), header_text, "pdf", warnings + [f"PDF text fallback failed: {e}"]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Image
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ---------------------------------------------------------------------------
+# Image / Scanned Statement Parser (Tesseract OCR)
+# ---------------------------------------------------------------------------
 def parse_image(file_path: str) -> tuple:
-    """
-    Always uses the line-based parser — never bbox.
-
-    Why no bbox:
-      Scanned image OCR gives noisy word coordinates.  Column anchors
-      shift by ±20 px per word, causing debit and credit to collapse
-      into a single "merged" column.  The line-based approach avoids
-      columns entirely and uses balance-delta to split debit/credit.
-    """
     try:
         import pytesseract
+        from PIL import Image
+        import PIL.ImageEnhance as IE
     except ImportError:
-        return pd.DataFrame(), "", "image", ["pytesseract not installed"]
+        return pd.DataFrame(), "", "image", ["pytesseract or pillow not installed"]
 
     warnings = []
+    header_text = ""
 
     try:
-        img = _preprocess(file_path)
+        img = Image.open(file_path).convert("L")
+        w, h = img.size
+
+        # Scale to at least 2400px wide for accuracy
+        scale = max(1, 2400 // max(w, 1))
+        if scale > 1:
+            img = img.resize((w * scale, h * scale), Image.LANCZOS)
+
+        img = IE.Contrast(img).enhance(1.5)
+        img = IE.Sharpness(img).enhance(2.0)
+
+        # Get word-level bounding boxes — this preserves column position info
+        # that plain text output loses (critical for reconstructing table structure)
+        tsv_data = pytesseract.image_to_data(
+            img, config="--psm 6 --oem 3",
+            output_type=pytesseract.Output.DATAFRAME
+        )
+
+        # Also get raw text for header extraction
+        raw_text = pytesseract.image_to_string(img, config="--psm 6 --oem 3 -c preserve_interword_spaces=1")
+        lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+        header_text = " ".join(lines[:5])
+
     except Exception as e:
-        return pd.DataFrame(), "", "image", [f"Preprocessing failed: {e}"]
+        return pd.DataFrame(), "", "image", [f"Image load/OCR error: {e}"]
 
-    try:
-        raw_text = pytesseract.image_to_string(
-        img, 
-        config="--psm 6 --oem 3 -c preserve_interword_spaces=1"
-    )
-    except Exception as e:
-        return pd.DataFrame(), "", "image", [f"OCR failed: {e}"]
+    df = _ocr_bbox_to_dataframe(tsv_data, warnings)
 
-    lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
-    header_text = "\n".join(lines[:25])
+    # Fallback to line-split parser if bbox reconstruction fails
+    if df.empty and lines:
+        warnings.append("OCR bbox reconstruction failed, trying line-split fallback")
+        df = _ocr_linefallback_to_dataframe(lines, warnings)
 
-    df = _text_line_parser(lines, header_text, warnings, source="image")
     if df.empty:
-        warnings.append("OCR: no parseable transactions found")
+        warnings.append("OCR produced no parseable table rows")
 
     return df, header_text, "image", warnings
 
 
-def _preprocess(file_path: str):
+def _ocr_bbox_to_dataframe(tsv: "pd.DataFrame", warnings: list) -> "pd.DataFrame":
     """
     OpenCV pipeline for clean OCR:
       1. Greyscale
@@ -371,10 +514,11 @@ def _text_line_parser(
         "withdrawal", "deposit", "particulars", "remarks", "ref", "txn",
         "cheque", "post", "tran", "amount",
     ]
-    hdr_idx = None
-    for i, ln in enumerate(lines):
-        if sum(1 for k in HDR if k in ln.lower()) >= 3:
-            hdr_idx = i
+    header_idx = None
+    for i, ll in enumerate(logical_lines):
+        hits = sum(1 for kw in header_keywords if kw in ll["text"].lower())
+        if hits >= 3:
+            header_idx = i
             break
             
     if hdr_idx is None:
@@ -531,10 +675,56 @@ def _text_line_parser(
 
     if not rows:
         return pd.DataFrame()
+    return pd.DataFrame(rows, columns=col_names)
 
-    df = pd.DataFrame(rows)
-    warnings.append(
-        f"Line parser ({source}): {len(df)} transactions"
-        + (f", bank={bank_code}" if bank_code else "")
-    )
-    return df
+
+# ---------------------------------------------------------------------------
+# JSON parser (for flattened transaction exports from ERPs/systems)
+# ---------------------------------------------------------------------------
+def parse_json(file_path: str) -> tuple:
+    import json
+    warnings = []
+    header_text = ""
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Handle both list of records and {"transactions": [...]} wrapper
+        if isinstance(data, list):
+            records = data
+        elif isinstance(data, dict):
+            # Find the first list value
+            for key, val in data.items():
+                if isinstance(val, list) and len(val) > 0:
+                    records = val
+                    header_text = str(key)
+                    break
+            else:
+                return pd.DataFrame(), "", "json", ["No list of records found in JSON"]
+        else:
+            return pd.DataFrame(), "", "json", ["Unsupported JSON structure"]
+
+        df = pd.json_normalize(records)
+        return df, header_text, "json", warnings
+
+    except Exception as e:
+        return pd.DataFrame(), "", "json", [f"JSON parse error: {e}"]
+
+
+# ---------------------------------------------------------------------------
+# TSV / pipe-delimited parser
+# ---------------------------------------------------------------------------
+def parse_tsv(file_path: str) -> tuple:
+    warnings = []
+    header_text = ""
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            sample = f.read(500)
+        # Detect delimiter
+        delim = "\t" if "\t" in sample else "|" if "|" in sample else ","
+        df = pd.read_csv(file_path, sep=delim, dtype=str,
+                         encoding="utf-8", errors="replace")
+        return df, header_text, "tsv", warnings
+    except Exception as e:
+        return pd.DataFrame(), "", "tsv", [f"TSV parse error: {e}"]
