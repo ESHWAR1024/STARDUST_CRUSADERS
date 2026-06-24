@@ -409,7 +409,7 @@ def _text_line_parser(
         m = _DATE_RE.search(cln)
         
         # Increased to 50 to account for wide left margins or empty first columns
-        return bool(m and m.start() < 50)
+        return bool(m and m.start() < 50 and _has_amt(cln))
 
     blocks, cur = [], None
     for ln in lines[hdr_idx + 1:]:
