@@ -297,12 +297,6 @@ def parse_image(file_path: str) -> tuple:
         img, 
         config="--psm 6 --oem 3 -c preserve_interword_spaces=1"
     )
-    
-    # ── DEBUG INJECTION: Save the raw OCR text to a file ──
-        with open("debug_ocr_output.txt", "w", encoding="utf-8") as f:
-            f.write(raw_text)
-        print("\n--- SAVED RAW OCR TO debug_ocr_output.txt ---")
-    # ──────────────────────────────────────────────────────
     except Exception as e:
         return pd.DataFrame(), "", "image", [f"OCR failed: {e}"]
 
