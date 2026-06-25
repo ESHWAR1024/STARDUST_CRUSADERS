@@ -22,9 +22,12 @@ from format_parsers import parse_csv, parse_xlsx, parse_pdf, parse_image
 from normalizer import normalize
 
 
-def ingest_file(file_path: str) -> tuple[pd.DataFrame, dict]:
+def ingest_file(file_path: str, pdf_password: str = None,
+                 pdf_password_candidates: list = None) -> tuple[pd.DataFrame, dict]:
     """
     Ingest a single file. Returns (normalized_df, report_row).
+    pdf_password / pdf_password_candidates are only used for .pdf files
+    that turn out to be encrypted - ignored otherwise.
     """
     ext = Path(file_path).suffix.lower()
     fname = os.path.basename(file_path)
@@ -51,9 +54,17 @@ def ingest_file(file_path: str) -> tuple[pd.DataFrame, dict]:
         elif ext in (".xlsx", ".xls"):
             raw_df, header_text, source_format, parse_warnings = parse_xlsx(file_path)
         elif ext == ".pdf":
-            raw_df, header_text, source_format, parse_warnings = parse_pdf(file_path)
-        elif ext in (".png", ".jpg", ".jpeg", ".tiff"):
+            raw_df, header_text, source_format, parse_warnings = parse_pdf(
+                file_path, password=pdf_password, password_candidates=pdf_password_candidates
+            )
+        elif ext in (".png", ".jpg", ".jpeg", ".tiff", ".tif"):
             raw_df, header_text, source_format, parse_warnings = parse_image(file_path)
+        elif ext == ".json":
+            from format_parsers import parse_json
+            raw_df, header_text, source_format, parse_warnings = parse_json(file_path)
+        elif ext in (".tsv", ".txt"):
+            from format_parsers import parse_tsv
+            raw_df, header_text, source_format, parse_warnings = parse_tsv(file_path)
         else:
             report["status"] = "skipped"
             return pd.DataFrame(), report
@@ -65,6 +76,12 @@ def ingest_file(file_path: str) -> tuple[pd.DataFrame, dict]:
     report["rows_parsed"] = len(raw_df)
     if parse_warnings:
         report["parse_warnings"] = " | ".join(parse_warnings)
+        # PDF parser flags this distinctly so it doesn't get lumped in
+        # with generic crashes - an investigator should see at a glance
+        # "this one needs a password", not "something went wrong".
+        if any(str(w).startswith("PASSWORD_PROTECTED") for w in parse_warnings):
+            report["status"] = "password_protected"
+            return pd.DataFrame(), report
 
     if raw_df.empty:
         report["status"] = "empty"
@@ -88,22 +105,25 @@ def ingest_file(file_path: str) -> tuple[pd.DataFrame, dict]:
     return normalized_df, report
 
 
-def ingest_directory(input_path: str, out_dir: str):
+def ingest_directory(input_path: str, out_dir: str, pdf_password: str = None,
+                      pdf_password_candidates: list = None):
     """Ingest all supported files in a directory."""
     files = [
         os.path.join(input_path, f)
         for f in sorted(os.listdir(input_path))
         if Path(f).suffix.lower() in SUPPORTED_EXTENSIONS
     ]
-    return _run_pipeline(files, out_dir)
+    return _run_pipeline(files, out_dir, pdf_password, pdf_password_candidates)
 
 
-def ingest_single(file_path: str, out_dir: str):
+def ingest_single(file_path: str, out_dir: str, pdf_password: str = None,
+                   pdf_password_candidates: list = None):
     """Ingest a single file."""
-    return _run_pipeline([file_path], out_dir)
+    return _run_pipeline([file_path], out_dir, pdf_password, pdf_password_candidates)
 
 
-def _run_pipeline(files: list, out_dir: str):
+def _run_pipeline(files: list, out_dir: str, pdf_password: str = None,
+                   pdf_password_candidates: list = None):
     os.makedirs(out_dir, exist_ok=True)
     all_dfs = []
     report_rows = []
@@ -113,11 +133,11 @@ def _run_pipeline(files: list, out_dir: str):
     print(f"Files to process: {len(files)}")
     print(f"{'='*60}")
 
-    for file_path in files:
+    for idx, file_path in enumerate(files, 1):
         fname = os.path.basename(file_path)
-        print(f"\n  [{files.index(file_path)+1}/{len(files)}] {fname}")
+        print(f"\n  [{idx}/{len(files)}] {fname}")
 
-        df, report = ingest_file(file_path)
+        df, report = ingest_file(file_path, pdf_password, pdf_password_candidates)
         report_rows.append(report)
 
         if not df.empty:
@@ -157,9 +177,19 @@ def _run_pipeline(files: list, out_dir: str):
 
 def _print_summary(report_rows, merged, dedup_removed, out_dir):
     total = len(report_rows)
-    ok = sum(1 for r in report_rows if r["status"] == "ok")
-    errored = sum(1 for r in report_rows if r["status"] in ("error", "normalization_error", "empty"))
+    # status can stay "ok" even when normalize() extracted zero usable
+    # rows (it only flips to "normalization_error"/"empty" on an actual
+    # exception or an empty parse, not on "parsed fine but everything got
+    # filtered out") — counting on rows_after_clean catches that case
+    # instead of silently reporting a file as successful with no data.
+    ok = sum(1 for r in report_rows if r["rows_after_clean"] > 0)
+    errored = sum(
+        1 for r in report_rows
+        if r["status"] in ("error", "normalization_error", "empty")
+        or (r["status"] == "ok" and r["rows_after_clean"] == 0)
+    )
     skipped = sum(1 for r in report_rows if r["status"] == "skipped")
+    password_protected = [r["file"] for r in report_rows if r["status"] == "password_protected"]
 
     print(f"\n{'='*60}")
     print("INGESTION SUMMARY")
@@ -168,12 +198,18 @@ def _print_summary(report_rows, merged, dedup_removed, out_dir):
     print(f"  Successfully      : {ok}")
     print(f"  Errors/empty      : {errored}")
     print(f"  Skipped           : {skipped}")
+    print(f"  Password-protected: {len(password_protected)}")
     if not merged.empty:
         print(f"Total rows ingested : {len(merged) + dedup_removed}")
         print(f"Duplicates removed  : {dedup_removed}")
         print(f"Final clean rows    : {len(merged)}")
         print(f"Banks detected      : {', '.join(merged['bank_name'].unique())}")
         print(f"Formats ingested    : {', '.join(merged['source_format'].unique())}")
+    if password_protected:
+        print(f"\n  ⚠ These files need a password — re-run with --pdf-password")
+        print(f"    or --pdf-passwords to supply one or more candidates:")
+        for f in password_protected:
+            print(f"      • {f}")
     print(f"\nOutputs written to: {os.path.abspath(out_dir)}")
     print(f"  ingested_transactions.csv")
     print(f"  ingestion_report.csv")
@@ -184,11 +220,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phase 6 — Bank Statement Ingestion Pipeline")
     parser.add_argument("--input", required=True, help="File or directory to ingest")
     parser.add_argument("--out-dir", default="ingested", help="Output directory")
+    parser.add_argument("--pdf-password", default=None,
+                         help="Password to try if a PDF turns out to be encrypted")
+    parser.add_argument("--pdf-passwords", default=None,
+                         help="Comma-separated list of candidate passwords to try in order "
+                              "(e.g. likely DOB/PAN/account-number-based formulas)")
     args = parser.parse_args()
 
+    candidates = [p.strip() for p in args.pdf_passwords.split(",")] if args.pdf_passwords else None
+
     if os.path.isdir(args.input):
-        ingest_directory(args.input, args.out_dir)
+        ingest_directory(args.input, args.out_dir, args.pdf_password, candidates)
     elif os.path.isfile(args.input):
-        ingest_single(args.input, args.out_dir)
+        ingest_single(args.input, args.out_dir, args.pdf_password, candidates)
     else:
         print(f"Error: {args.input} is not a valid file or directory")

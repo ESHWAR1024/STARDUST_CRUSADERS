@@ -1,123 +1,183 @@
 """
-Phase 6 - Ingestion Pipeline Configuration
+Phase 6 - Ingestion Configuration
 
-Defines:
-- UNIFIED_SCHEMA: the canonical column names every parser must output
-- BANK_FORMAT_REGISTRY: per-bank column mappings + date formats
-- File type detection helpers
+Designed for arbitrary financial datasets — not just standard bank statements.
+The judges may provide any CSV/Excel/PDF with transaction data in any format.
+
+Three-tier detection strategy:
+  Tier 1: Keyword matching on column headers (handles known formats)
+  Tier 2: Content-based column inference (handles unknown header names)
+  Tier 3: Positional fallback (Col1/Col2 style — last resort)
 """
 
-# ---------------------------------------------------------------------------
-# Unified schema — every parser must produce exactly these columns
-# ---------------------------------------------------------------------------
 UNIFIED_SCHEMA = [
-    "account_id",           # from filename or metadata
-    "account_holder",       # from file header if present
-    "bank_name",            # detected from file header / registry
-    "date",                 # ISO format YYYY-MM-DD
-    "time",                 # HH:MM:SS (00:00:00 if not present)
-    "narration",            # transaction description
-    "channel",              # inferred from narration where possible
-    "debit",                # float, 0.0 if not applicable
-    "credit",               # float, 0.0 if not applicable
-    "balance",              # float
-    "utr_ref",              # reference / cheque number
-    "counterparty_name",    # from narration where extractable
-    "source_file",          # original filename for traceability
-    "source_format",        # csv | xlsx | pdf | image
-    "ingestion_warnings",   # pipe-separated list of issues found
+    "account_id", "account_holder", "bank_name",
+    "date", "time", "narration", "channel",
+    "debit", "credit", "balance",
+    "utr_ref", "counterparty_name",
+    "source_file", "source_format", "ingestion_warnings",
 ]
 
 # ---------------------------------------------------------------------------
-# Per-bank format registry — maps each bank's native column names to
-# UNIFIED_SCHEMA fields. The ingestion pipeline auto-detects which bank
-# a statement belongs to by matching column headers.
+# Tier 1: Keyword fragments for column role detection
+# Checked as case-insensitive substrings in column header names
 # ---------------------------------------------------------------------------
-BANK_FORMAT_REGISTRY = {
-    "SBI": {
-        "bank_name": "State Bank of India",
-        "date_col": "Txn Date",
-        "narration_col": "Description",
-        "ref_col": "Ref No./Cheque No.",
-        "debit_col": "Debit",
-        "credit_col": "Credit",
-        "balance_col": "Balance",
-        "date_formats": ["%d/%m/%y", "%d/%m/%Y", "%d-%m-%Y"],
-    },
-    "HDFC": {
-        "bank_name": "HDFC Bank",
-        "date_col": "Date",
-        "narration_col": "Narration",
-        "ref_col": "Chq./Ref.No.",
-        "debit_col": "Withdrawal Amt.",
-        "credit_col": "Deposit Amt.",
-        "balance_col": "Closing Balance",
-        "date_formats": ["%d/%m/%Y", "%d/%m/%y"],
-    },
-    "ICICI": {
-        "bank_name": "ICICI Bank",
-        "date_col": "Transaction Date",
-        "narration_col": "Transaction Remarks",
-        "ref_col": "Cheque Number",
-        "debit_col": "Withdrawal Amount (INR)",
-        "credit_col": "Deposit Amount (INR)",
-        "balance_col": "Balance (INR)",
-        "date_formats": ["%d-%b-%Y", "%d/%m/%Y"],
-    },
-    "AXIS": {
-        "bank_name": "Axis Bank",
-        "date_col": "Tran Date",
-        "narration_col": "Particulars",
-        "ref_col": "Cheque No",
-        "debit_col": "Debit",
-        "credit_col": "Credit",
-        "balance_col": "Balance",
-        "date_formats": ["%Y-%m-%d", "%d/%m/%Y"],
-    },
-    "CANARA": {
-        "bank_name": "Canara Bank",
-        "date_col": "Date",
-        "narration_col": "Particulars",
-        "ref_col": "Instrument Id",
-        "debit_col": "Withdrawals",
-        "credit_col": "Deposits",
-        "balance_col": "Balance",
-        "date_formats": ["%d-%m-%Y", "%d/%m/%Y"],
-    },
-    "PNB": {
-        "bank_name": "Punjab National Bank",
-        "date_col": "Post Date",
-        "narration_col": "Remarks",
-        "ref_col": "Cheque No/Ref No",
-        "debit_col": "Debit",
-        "credit_col": "Credit",
-        "balance_col": "Balance",
-        "date_formats": ["%d.%m.%Y", "%d/%m/%Y"],
-    },
+COLUMN_ROLE_KEYWORDS = {
+    "date": [
+        "txn date", "tran date", "transaction date", "post date",
+        "value date", "posting date", "trans date", "entry date",
+        "date of transaction", "booking date", "process date",
+        "effective date", "settlement date", "txn_date", "trn_date",
+        "date",   # short match last so specific ones score higher
+    ],
+    "narration": [
+        "description", "narration", "particulars", "remarks",
+        "transaction details", "transaction particulars",
+        "transaction remarks", "details of transaction",
+        "beneficiary", "transaction type", "entry description",
+        "memo", "note", "details", "narrative", "text",
+        "txn_desc", "trn_desc", "trans_desc",
+    ],
+    "debit": [
+        "debit amount", "withdrawal amount", "amount debited",
+        "debit amt", "withdrawal amt", "dr amount", "dr amt",
+        "amount (dr)", "paid out", "money out", "debit",
+        "withdrawal", "withdrawals", "dr",
+    ],
+    "credit": [
+        "credit amount", "deposit amount", "amount credited",
+        "credit amt", "deposit amt", "cr amount", "cr amt",
+        "amount (cr)", "paid in", "money in", "credit",
+        "deposit", "deposits", "cr",
+    ],
+    "balance": [
+        "closing balance", "running balance", "available balance",
+        "balance amount", "closing bal", "bal amount",
+        "current balance", "book balance", "ledger balance",
+        "balance",
+    ],
+    "ref": [
+        "reference number", "cheque number", "transaction id",
+        "transaction ref", "ref no", "cheque no", "utr number",
+        "chq/ref", "instrument id", "tran id", "txn id",
+        "vch no", "voucher no", "journal no", "entry no",
+        "txn_ref", "ref_num", "reference",
+    ],
+    "amount": [
+        # Single-amount-column formats (+/- or CR/DR notation)
+        "amount(+cr/-dr)", "amount (+cr/-dr)", "net amount",
+        "transaction amount", "txn amount", "amount",
+    ],
 }
 
-# Keyword → bank code mapping for header-line bank detection
+# ---------------------------------------------------------------------------
+# Tier 2: Content-based detection patterns
+# Used when column headers are unknown (Col1, A, B, etc.)
+# Each pattern is applied to the first N data rows of each column
+# ---------------------------------------------------------------------------
+import re
+
+CONTENT_PATTERNS = {
+    "date": [
+        # ISO date: 2026-01-15
+        re.compile(r'^\d{4}-\d{2}-\d{2}$'),
+        # Indian date: 15/01/2026 or 15-01-2026
+        re.compile(r'^\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}$'),
+        # Month-name date: 15-Jan-2026
+        re.compile(r'^\d{1,2}[- ][A-Za-z]{3}[- ]\d{2,4}$'),
+    ],
+    "amount": [
+        # Pure numeric with optional commas and decimal
+        re.compile(r'^[\d,]+\.?\d*$'),
+        # With CR/DR suffix
+        re.compile(r'^[\d,]+\.?\d*\s*(CR|DR|Cr|Dr)$'),
+        # Bracket negative
+        re.compile(r'^\([\d,]+\.?\d*\)$'),
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# Hindi / regional language column names (transliterated)
+# ---------------------------------------------------------------------------
+HINDI_COLUMN_MAP = {
+    # Date equivalents
+    "दिनांक": "date", "तारीख": "date", "दिन": "date",
+    # Amount equivalents
+    "राशि": "amount", "रकम": "amount", "धनराशि": "amount",
+    # Debit equivalents
+    "नामे": "debit", "डेबिट": "debit",
+    # Credit equivalents
+    "जमा": "credit", "क्रेडिट": "credit",
+    # Balance equivalents
+    "शेष": "balance", "बकाया": "balance", "शेष राशि": "balance",
+    # Narration equivalents
+    "विवरण": "narration", "ब्यौरा": "narration",
+}
+
+# ---------------------------------------------------------------------------
+# Bank name detection
+# ---------------------------------------------------------------------------
 BANK_NAME_KEYWORDS = {
-    "state bank": "SBI",
-    "sbi": "SBI",
-    "hdfc": "HDFC",
-    "icici": "ICICI",
-    "axis": "AXIS",
-    "canara": "CANARA",
-    "punjab national": "PNB",
-    "pnb": "PNB",
+    "state bank of india": "State Bank of India",
+    "sbi":                 "State Bank of India",
+    "hdfc":                "HDFC Bank",
+    "icici":               "ICICI Bank",
+    "axis":                "Axis Bank",
+    "canara":              "Canara Bank",
+    "punjab national":     "Punjab National Bank",
+    "pnb":                 "Punjab National Bank",
+    "kotak":               "Kotak Mahindra Bank",
+    "yes bank":            "Yes Bank",
+    "indusind":            "IndusInd Bank",
+    "bank of india":       "Bank of India",
+    "bank of baroda":      "Bank of Baroda",
+    "union bank":          "Union Bank of India",
+    "central bank":        "Central Bank of India",
+    "indian bank":         "Indian Bank",
+    "idbi":                "IDBI Bank",
+    "federal bank":        "Federal Bank",
+    "south indian":        "South Indian Bank",
+    "karnataka bank":      "Karnataka Bank",
+    "bandhan":             "Bandhan Bank",
+    "rbl":                 "RBL Bank",
+    "idfc":                "IDFC First Bank",
+    "au small":            "AU Small Finance Bank",
 }
 
-# Channel inference: if these strings appear in narration → assign channel
-CHANNEL_KEYWORDS = [
-    ("UPI", ["upi", "gpay", "phonepe", "paytm", "bhim"]),
-    ("NEFT", ["neft"]),
-    ("IMPS", ["imps"]),
-    ("RTGS", ["rtgs"]),
-    ("ATM", ["atm wdl", "atm withdrawal", "cash withdrawal"]),
-    ("ECS", ["ecs", "nach"]),
-    ("BILLPAY", ["billdesk", "billpay", "utility", "electricity", "water bill"]),
-    ("CHEQUE", ["clg", "clearing", "chq", "cheque"]),
+# ---------------------------------------------------------------------------
+# Date formats to try in order
+# ---------------------------------------------------------------------------
+DATE_FORMATS = [
+    "%d/%m/%Y", "%d/%m/%y",
+    "%d-%m-%Y", "%d-%m-%y",
+    "%d-%b-%Y", "%d-%b-%y",
+    "%d.%m.%Y", "%d.%m.%y",
+    "%Y-%m-%d",
+    "%d %b %Y", "%d %b %y",
+    "%d %B %Y",
+    "%m/%d/%Y",
+    "%Y/%m/%d",
+    "%d-%B-%Y",
 ]
 
-SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg", ".tiff"}
+# ---------------------------------------------------------------------------
+# Channel inference keywords
+# ---------------------------------------------------------------------------
+CHANNEL_KEYWORDS = [
+    ("UPI",     ["upi", "gpay", "phonepe", "paytm", "bhim", "googlepay"]),
+    ("NEFT",    ["neft"]),
+    ("IMPS",    ["imps"]),
+    ("RTGS",    ["rtgs"]),
+    ("ATM",     ["atm", "cash withdrawal", "atm wdl", "cwdl"]),
+    ("ECS",     ["ecs", "nach", "si-", "standing instruction"]),
+    ("CHEQUE",  ["clg", "clearing", "chq", "cheque", "chq dep"]),
+    ("BILLPAY", ["billdesk", "billpay", "bbps", "electricity", "utility"]),
+    ("CASH",    ["cash dep", "cash deposit", "counter deposit"]),
+    ("WIRE",    ["swift", "wire", "foreign", "remittance", "international"]),
+]
+
+SUPPORTED_EXTENSIONS = {
+    ".csv", ".xlsx", ".xls", ".pdf",
+    ".png", ".jpg", ".jpeg", ".tiff", ".tif",
+    ".json", ".tsv", ".txt",
+}

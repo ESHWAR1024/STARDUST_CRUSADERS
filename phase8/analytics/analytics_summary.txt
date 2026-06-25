@@ -1,0 +1,93 @@
+======================================================================
+PHASE 8 — INVESTIGATION ANALYTICS SUMMARY
+Run at : 2026-06-24T16:16:36.601557
+Input  : cleaned_transactions.csv
+======================================================================
+
+OVERVIEW
+----------------------------------------
+  Rows analysed           : 1,638
+  Accounts analysed       : 13
+  Rows with analytics flag: 708
+
+GRAPH STATISTICS
+----------------------------------------
+  Graph nodes             : 699
+  Graph edges (transfers) : 1175
+  Connected components    : 6
+
+PATTERN DETECTION RESULTS
+----------------------------------------
+  Round-trips             : 0
+  Layering chains         : 0
+  Fan-in collectors       : 3
+  Fan-out distributors    : 8
+  Smurfing / structuring  : 0
+  Odd-hour accounts       : 10
+
+RISK SCORE DISTRIBUTION
+----------------------------------------
+  CRITICAL (≥75)          : 0
+  HIGH     (≥50)          : 0
+  MEDIUM   (≥25)          : 8
+  LOW      (<25)          : 5
+
+TOP 10 HIGHEST-RISK ACCOUNTS
+----------------------------------------
+  [MEDIUM  ] bank_statements Score: 40.0  nan
+             Patterns : FAN_OUT | ODD_HOUR | VELOCITY | HIGH_VALUE | BALANCE_BREACH | NEW_HV_BENE
+             Reasoning: Fan-out: ₹21,030 to 5 receivers | Odd-hour activity: 35 transactions between 00:00–05:00 | Velocity 
+
+  [MEDIUM  ] 97381926247803 Score: 38.0  Neel Randhawa
+             Patterns : FAN_IN | FAN_OUT | ODD_HOUR | HIGH_VALUE | NEW_HV_BENE
+             Reasoning: Fan-in collector: ₹31,334 from 14 senders | Fan-out: ₹24,387 to 6 receivers | Odd-hour activity: 26 
+
+  [MEDIUM  ] 66612153923890 Score: 38.0  Gagan Ganguly
+             Patterns : FAN_IN | FAN_OUT | ODD_HOUR | HIGH_VALUE | NEW_HV_BENE
+             Reasoning: Fan-in collector: ₹832,257 from 19 senders | Fan-out: ₹2,605,103,135,486 to 19 receivers | Odd-hour 
+
+  [MEDIUM  ] 74702946617730 Score: 38.0  Pavani Deshpande
+             Patterns : FAN_IN | FAN_OUT | ODD_HOUR | HIGH_VALUE | NEW_HV_BENE
+             Reasoning: Fan-in collector: ₹170,965 from 10 senders | Fan-out: ₹1,145,940,879,653 to 9 receivers | Odd-hour a
+
+  [MEDIUM  ] 95703957819860 Score: 28.0  Maanav Sengupta
+             Patterns : FAN_OUT | ODD_HOUR | HIGH_VALUE | NEW_HV_BENE
+             Reasoning: Fan-out: ₹49,740 to 10 receivers | Odd-hour activity: 27 transactions between 00:00–05:00 | High-val
+
+  [MEDIUM  ] 32516913425860 Score: 28.0  Anjali Majumdar
+             Patterns : FAN_OUT | ODD_HOUR | HIGH_VALUE | NEW_HV_BENE
+             Reasoning: Fan-out: ₹20,472 to 6 receivers | Odd-hour activity: 167 transactions between 00:00–05:00 | High-val
+
+  [MEDIUM  ] 74037039520973 Score: 28.0  Radhika Prabhakar
+             Patterns : FAN_OUT | ODD_HOUR | HIGH_VALUE | NEW_HV_BENE
+             Reasoning: Fan-out: ₹31,721 to 12 receivers | Odd-hour activity: 123 transactions between 00:00–05:00 | High-va
+
+  [MEDIUM  ] 32289633792970 Score: 28.0  Rachana Saini
+             Patterns : FAN_OUT | ODD_HOUR | HIGH_VALUE | NEW_HV_BENE
+             Reasoning: Fan-out: ₹23,820 to 7 receivers | Odd-hour activity: 183 transactions between 00:00–05:00 | High-val
+
+  [LOW     ] 18764857452067 Score: 18.0  Laban Goel
+             Patterns : ODD_HOUR | HIGH_VALUE | NEW_HV_BENE
+             Reasoning: Odd-hour activity: 74 transactions between 00:00–05:00 | High-value outlier: IQR outlier flagged in 
+
+  [LOW     ] 23877084635732 Score: 10.0  Nirja Swaminathan
+             Patterns : BALANCE_BREACH | NEW_HV_BENE
+             Reasoning: Balance breach: statement balance does not reconcile | New high-value beneficiary: first-time large 
+
+
+OUTPUT FILES
+----------------------------------------
+  analytics_transactions.csv   ← all rows + Phase 8 flags → Feed to Phase 9/10
+  round_trips.csv              ← round-trip findings
+  layering_chains.csv          ← layering chain findings
+  fan_in.csv                   ← collector account findings
+  fan_out.csv                  ← distribution account findings
+  smurfing.csv                 ← structuring findings
+  odd_hours.csv                ← odd-hour findings
+  beneficiaries.csv            ← beneficiary profiles per account
+  risk_scores.csv              ← per-account risk score, tier, reasoning
+  money_trails/                ← forward/backward fund traces for top accounts
+  graph_summary.json           ← graph statistics
+  analytics_report.json        ← machine-readable full report
+  analytics_summary.txt        ← this file
+======================================================================
