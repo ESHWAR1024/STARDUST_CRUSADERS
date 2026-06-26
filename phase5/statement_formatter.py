@@ -25,8 +25,24 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER
 
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-FONT_PATH_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
+# ---------------------------------------------------------------------------
+# Cross-platform font configuration
+# ---------------------------------------------------------------------------
+if os.name == "nt":  # Windows
+    FONT_PATH = r"C:\Windows\Fonts\consola.ttf"
+    FONT_PATH_BOLD = r"C:\Windows\Fonts\consolab.ttf"
+else:  # Linux
+    FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+    FONT_PATH_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
+
+def load_font(size, bold=False):
+    """
+    Load a TrueType font with a graceful fallback.
+    """
+    try:
+        return ImageFont.truetype(FONT_PATH_BOLD if bold else FONT_PATH, size)
+    except Exception:
+        return ImageFont.load_default()
 
 # ---------------------------------------------------------------------------
 # Per-bank "as received" layouts - column names, order, and date format
@@ -277,9 +293,9 @@ def render_scanned_statement_image(acct, statement_df, out_path, max_rows=28):
 
     img = Image.new("L", (width, height), color=250)
     draw = ImageDraw.Draw(img)
-    font = ImageFont.truetype(FONT_PATH, 16)
-    font_bold = ImageFont.truetype(FONT_PATH_BOLD, 18)
-    font_title = ImageFont.truetype(FONT_PATH_BOLD, 22)
+    font = load_font(16)
+    font_bold = load_font(18, bold=True)
+    font_title = load_font(22, bold=True)
 
     y = margin
     draw.text((margin, y), f"{acct.bank_name} - Account Statement", font=font_title, fill=10)
