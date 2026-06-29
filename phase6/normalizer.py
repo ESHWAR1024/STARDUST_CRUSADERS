@@ -1,23 +1,31 @@
 """
-Phase 6 - Normalizer
+Phase 6 — Normalizer  (v2)
 
-Handles any financial dataset — not just bank statements.
-Uses three-tier column detection and gracefully handles:
-  - Missing balance column (computed from running totals)
-  - Single-amount column with +/- or CR/DR notation
-  - Hindi/regional language headers
-  - Completely unknown column names (Col1, A, B...)
-  - Tally, QuickBooks, ERP, court/police formats
+Converts any raw parsed DataFrame into the unified schema.
+
+New in v2:
+  • Paytm XLSX: COD_DRCR direction column, COD_ACCT_NO_FROM/TO graph edges
+  • BOB/Federal XLSX: BENEF/REMIT ACCT NO + IFSC extraction
+  • IDFC balance: strips "Cr"/"Dr" suffix from balance column
+  • counterparty_account + counterparty_ifsc now populated for all formats
+  • Improved account_id extraction from statement header text
+  • Balance delta inference for BOB 3-column PDFs
 """
 
 import os
 import re
 import pandas as pd
-from ingestion_config import UNIFIED_SCHEMA
+from ingestion_config import (
+    UNIFIED_SCHEMA,
+    PAYTM_DRCR_COL, PAYTM_FROM_COL, PAYTM_TO_COL, PAYTM_AMOUNT_COL,
+    BOB_BENEF_ACCT_COL, BOB_BENEF_IFSC_COL, BOB_BENEF_NAME_COL,
+)
 from schema_detector import (
     detect_bank, find_header_row, assign_column_roles,
+    assign_column_roles_by_keywords,
     compute_running_balance, parse_date, parse_amount,
     infer_channel, extract_counterparty,
+    extract_counterparty_account, extract_counterparty_ifsc,
 )
 
 
@@ -28,17 +36,15 @@ def normalize(
     source_format: str,
     provided_account_id: str = None,
 ) -> tuple[pd.DataFrame, list]:
-    warnings = []
+    """
+    Main entry point. Returns (normalized_df, warnings_list).
+    """
+    warnings: list[str] = []
 
     if raw_df is None or raw_df.empty:
         return pd.DataFrame(columns=UNIFIED_SCHEMA), ["Empty input"]
 
-    # -----------------------------------------------------------------------
-    # Step 1: Find real header row
-    # OCR (image) sources skip this — the OCR bbox parser already handles
-    # header detection. Running find_header_row on garbled OCR column names
-    # makes things worse, not better.
-    # -----------------------------------------------------------------------
+    # ── Step 1: Find real header row (skip for OCR/image — already handled) ──
     if source_format not in ("image",):
         header_row_idx = find_header_row(raw_df)
         if header_row_idx > 0:
@@ -51,82 +57,84 @@ def normalize(
     raw_df = raw_df.loc[:, raw_df.notna().any()]
 
     if raw_df.empty:
-        return pd.DataFrame(columns=UNIFIED_SCHEMA), ["No data rows after header detection"]
+        return pd.DataFrame(columns=UNIFIED_SCHEMA), [
+            "No data rows after header detection"
+        ]
 
-    # -----------------------------------------------------------------------
-    # Step 2: Detect bank name
-    # -----------------------------------------------------------------------
-    bank_name, bank_detection_method = detect_bank(header_text)
+    # ── Step 2: Detect bank ───────────────────────────────────────────────────
+    bank_name, bank_method = detect_bank(header_text)
     if bank_name == "Unknown Bank":
-        bank_name, bank_detection_method = detect_bank(os.path.basename(source_file))
+        bank_name, bank_method = detect_bank(os.path.basename(source_file))
 
-    # -----------------------------------------------------------------------
-    # Step 3: Three-tier column role assignment
-    # -----------------------------------------------------------------------
+    # ── Step 3: Check for special-schema formats ──────────────────────────────
+    # Paytm: has COD_DRCR column that encodes direction
+    if PAYTM_DRCR_COL in raw_df.columns:
+        return _normalize_paytm(
+            raw_df, header_text, source_file, source_format,
+            bank_name, provided_account_id, warnings
+        )
+
+    # BOB / Federal XLSX: has BENEF/REMIT columns
+    if BOB_BENEF_ACCT_COL in raw_df.columns or "BENEF/REMIT ACCT NO" in raw_df.columns:
+        return _normalize_bob_xlsx(
+            raw_df, header_text, source_file, source_format,
+            bank_name, provided_account_id, warnings
+        )
+
+    # ── Step 4: Column role detection (3-tier) ────────────────────────────────
     try:
         roles = assign_column_roles(raw_df.columns.tolist(), df=raw_df)
     except Exception as e:
-        warnings.append(f"Column role detection error: {e} — attempting keyword-only fallback")
+        warnings.append(f"Column role detection error: {e}")
         try:
-            from schema_detector import assign_column_roles_by_keywords
             roles = assign_column_roles_by_keywords(raw_df.columns.tolist())
         except Exception:
-            return pd.DataFrame(columns=UNIFIED_SCHEMA), warnings + ["Column detection failed completely"]
+            return pd.DataFrame(columns=UNIFIED_SCHEMA), warnings + [
+                "Column detection failed completely"
+            ]
 
-    # -----------------------------------------------------------------------
-    # Step 3b: Validate date column — OCR often splits "Post Date" into
-    # "Post" + "Date" columns. Pick the column with actual date values.
-    # -----------------------------------------------------------------------
+    # Validate date column
     date_col = roles.get("date")
     if date_col:
-        from schema_detector import parse_date as _parse_date
         sample = raw_df[date_col].dropna().astype(str).head(10)
-        date_hits = sum(1 for v in sample if _parse_date(v) and not _parse_date(v) == v)
+        date_hits = sum(1 for v in sample if parse_date(v))
         if date_hits < 2:
-            # Try all other columns to find one with actual date content
             for col in raw_df.columns:
                 if col == date_col:
                     continue
-                s = raw_df[col].dropna().astype(str).head(10)
-                hits = sum(1 for v in s if _parse_date(v) and not _parse_date(v) == v)
-                if hits > date_hits:
-                    date_hits = hits
-                    date_col = col
+                s2 = raw_df[col].dropna().astype(str).head(10)
+                hits2 = sum(1 for v in s2 if parse_date(v))
+                if hits2 > date_hits:
+                    date_hits, date_col = hits2, col
             roles["date"] = date_col
 
-    # Log what was detected
     warnings.append(
-        f"Bank: {bank_name} (via {bank_detection_method}) | "
-        f"date={roles.get('date')} | narration={roles.get('narration')} | "
-        f"debit={roles.get('debit') or roles.get('amount')} | "
-        f"credit={roles.get('credit') or roles.get('amount')} | "
-        f"balance={roles.get('balance')}"
+        f"Bank: {bank_name} ({bank_method}) | "
+        f"date={roles.get('date')} | nar={roles.get('narration')} | "
+        f"dr={roles.get('debit') or roles.get('amount')} | "
+        f"cr={roles.get('credit') or roles.get('amount')} | "
+        f"bal={roles.get('balance')}"
     )
 
-    # Critical check: need at least a date column
     if not roles.get("date"):
-        warnings.append(f"CRITICAL: Could not identify date column. Columns: {raw_df.columns.tolist()}")
+        warnings.append(
+            f"CRITICAL: No date column found. Columns: {raw_df.columns.tolist()}"
+        )
         return pd.DataFrame(columns=UNIFIED_SCHEMA), warnings
 
-    # -----------------------------------------------------------------------
-    # Step 4: Compute balance if missing
-    # -----------------------------------------------------------------------
+    # ── Step 5: Compute balance if missing ───────────────────────────────────
     balance_col = roles.get("balance")
     balance_computed = False
     if not balance_col:
-        debit_c  = roles.get("debit")  or roles.get("amount")
-        credit_c = roles.get("credit") or roles.get("amount")
-        if debit_c and credit_c:
-            raw_df["_computed_balance"] = compute_running_balance(
-                raw_df, debit_c, credit_c, start_balance=0.0
-            )
+        dc = roles.get("debit") or roles.get("amount")
+        cc = roles.get("credit") or roles.get("amount")
+        if dc and cc:
+            raw_df["_computed_balance"] = compute_running_balance(raw_df, dc, cc)
             balance_col = "_computed_balance"
             balance_computed = True
-            warnings.append("Balance column not found — computed from running debit/credit totals")
+            warnings.append("Balance computed from running debit/credit")
 
-    # -----------------------------------------------------------------------
-    # Step 5: Metadata
-    # -----------------------------------------------------------------------
+    # ── Step 6: Metadata ─────────────────────────────────────────────────────
     account_holder = _extract_account_holder(header_text)
     account_id = (
         provided_account_id
@@ -134,94 +142,109 @@ def normalize(
         or _extract_account_id_from_filename(source_file)
     )
 
-    # -----------------------------------------------------------------------
-    # Step 6: Row-by-row normalization
-    # -----------------------------------------------------------------------
+    # ── Step 7: Row-by-row normalization ─────────────────────────────────────
     output_rows = []
+    prev_balance = None
     skipped = 0
 
     for _, row in raw_df.iterrows():
-
-        # Date — skip rows with no parseable date
         date_str = parse_date(_get(row, roles.get("date")))
         if not date_str:
             skipped += 1
             continue
 
-        # Narration — if no narration column was identified, fall back to
-        # concatenating whatever unmapped columns this row has, rather
-        # than leaving every transaction's narration blank.
         narration = str(_get(row, roles.get("narration")) or "").strip()
         if not narration:
             narration = _build_narration_from_unmapped(row, roles)
         narration = narration.upper()
 
-        # Amounts
         debit, credit = 0.0, 0.0
 
         if roles.get("debit") and roles.get("credit"):
-            # Standard two-column format
             debit,  d_sign = parse_amount(_get(row, roles["debit"]))
             credit, c_sign = parse_amount(_get(row, roles["credit"]))
-            # If debit column had CR sign, it's actually a credit reversal
             if d_sign == "+":
                 credit, debit = debit, 0.0
             if c_sign == "-":
                 debit, credit = credit, 0.0
-
         elif roles.get("amount"):
-            # Single amount column
             amt, sign = parse_amount(_get(row, roles["amount"]))
             if sign == "+":
                 credit = amt
             elif sign == "-":
                 debit = amt
             else:
-                # Infer from narration context
-                nar_lower = narration.lower()
-                if any(w in nar_lower for w in [
+                nl = narration.lower()
+                if any(w in nl for w in [
                     "cr-", " cr ", "credit", "deposit", "received",
                     "salary", "refund", "cashback", "interest credit",
                 ]):
                     credit = amt
                 else:
                     debit = amt
+        elif roles.get("drcr"):
+            # Generic DR/CR direction column
+            drcr_val = str(_get(row, roles["drcr"]) or "").strip().upper()
+            amt_col = roles.get("debit") or roles.get("credit") or roles.get("amount")
+            if amt_col:
+                amt, _ = parse_amount(_get(row, amt_col))
+                if drcr_val in ("C", "CR", "CREDIT"):
+                    credit = amt
+                else:
+                    debit = amt
 
-        # Balance
         balance = 0.0
         if balance_col:
-            b, _ = parse_amount(_get(row, balance_col))
-            balance = b
+            balance, b_sign = parse_amount(_get(row, balance_col))
+            # IDFC: balance with "Dr" suffix means overdrawn (negative)
+            if b_sign == "-":
+                balance = -balance
 
-        # Skip pure zero rows (header repeats, subtotal rows)
+        # Infer debit/credit from balance delta for BOB 3-col PDFs
+        if debit == 0.0 and credit == 0.0 and balance != 0.0 and prev_balance is not None:
+            delta = round(balance - prev_balance, 2)
+            if delta > 0:
+                credit = delta
+            elif delta < 0:
+                debit = abs(delta)
+
         if debit == 0.0 and credit == 0.0 and balance == 0.0:
             skipped += 1
+            prev_balance = balance
             continue
+
+        prev_balance = balance
 
         utr_ref = str(_get(row, roles.get("ref")) or "").strip()
         time_str = _extract_time(row, roles)
 
+        # Counterparty extraction
+        cp_name    = extract_counterparty(narration)
+        cp_account = extract_counterparty_account(narration)
+        cp_ifsc    = extract_counterparty_ifsc(narration)
+
         output_rows.append({
-            "account_id":        account_id,
-            "account_holder":    account_holder,
-            "bank_name":         bank_name,
-            "date":              date_str,
-            "time":              time_str,
-            "narration":         narration,
-            "channel":           infer_channel(narration),
-            "debit":             round(debit, 2),
-            "credit":            round(credit, 2),
-            "balance":           round(balance, 2),
-            "utr_ref":           utr_ref,
-            "counterparty_name": extract_counterparty(narration),
-            "source_file":       os.path.basename(source_file),
-            "source_format":     source_format,
-            "ingestion_warnings": "balance_computed" if balance_computed else "",
+            "account_id":          account_id,
+            "account_holder":      account_holder,
+            "bank_name":           bank_name,
+            "date":                date_str,
+            "time":                time_str,
+            "narration":           narration,
+            "channel":             infer_channel(narration),
+            "debit":               round(debit, 2),
+            "credit":              round(credit, 2),
+            "balance":             round(balance, 2),
+            "utr_ref":             utr_ref,
+            "counterparty_name":   cp_name,
+            "counterparty_account": cp_account,
+            "counterparty_ifsc":   cp_ifsc,
+            "source_file":         os.path.basename(source_file),
+            "source_format":       source_format,
+            "ingestion_warnings":  "balance_computed" if balance_computed else "",
         })
 
     if skipped:
         warnings.append(f"Skipped {skipped} non-transaction rows")
-
     if not output_rows:
         warnings.append("No transaction rows could be extracted")
         return pd.DataFrame(columns=UNIFIED_SCHEMA), warnings
@@ -229,6 +252,244 @@ def normalize(
     return pd.DataFrame(output_rows, columns=UNIFIED_SCHEMA), warnings
 
 
+# ===========================================================================
+# Special normalizer: Paytm Payments Bank XLSX
+# COD_DRCR='C' → credit, 'D' → debit
+# COD_ACCT_NO_FROM / COD_ACCT_NO_TO → direct graph edges
+# ===========================================================================
+def _normalize_paytm(raw_df, header_text, source_file, source_format,
+                      bank_name, provided_account_id, warnings) -> tuple:
+    warnings.append("Paytm XLSX: using COD_DRCR direction + FROM/TO accounts")
+    bank_name = bank_name if bank_name != "Unknown Bank" else "Paytm Payments Bank"
+
+    account_id = (
+        provided_account_id
+        or _extract_account_id_from_text(header_text)
+        or _extract_account_id_from_filename(source_file)
+    )
+
+    # Detect account ID from the ACCT_NO column itself
+    if "COD_ACCT_NO" in raw_df.columns:
+        acct_series = raw_df["COD_ACCT_NO"].dropna()
+        if not acct_series.empty:
+            account_id = str(acct_series.iloc[0]).strip()
+
+    output_rows = []
+    for _, row in raw_df.iterrows():
+        date_str = parse_date(_get(row, "DAT_TXN_PROCESSING")
+                              or _get(row, "DAT_TXN_VALUE"))
+        if not date_str:
+            continue
+
+        drcr = str(_get(row, PAYTM_DRCR_COL) or "").strip().upper()
+        try:
+            amt = abs(float(str(_get(row, PAYTM_AMOUNT_COL) or "0")
+                            .replace(",", "")))
+        except (ValueError, TypeError):
+            amt = 0.0
+
+        if amt == 0.0:
+            continue
+
+        debit  = amt if drcr == "D" else 0.0
+        credit = amt if drcr == "C" else 0.0
+
+        narration_raw = (
+            _get(row, "TXT_TXN_DESC")
+            or _get(row, "TXT_TRAN_PARTICULAR")
+            or _get(row, "TXT_TXN_NARRATIVE_TO")
+            or ""
+        )
+        narration = str(narration_raw).upper().strip()
+
+        # Direct counterparty from FROM/TO columns
+        if drcr == "D":
+            cp_account = str(_get(row, "COD_ACCT_NO_TO") or "").strip()
+        else:
+            cp_account = str(_get(row, "COD_ACCT_NO_FROM") or "").strip()
+
+        utr_ref = str(_get(row, "REF_TXN_NO") or "").strip()
+
+        output_rows.append({
+            "account_id":          account_id,
+            "account_holder":      _extract_account_holder(header_text),
+            "bank_name":           bank_name,
+            "date":                date_str,
+            "time":                "00:00:00",
+            "narration":           narration,
+            "channel":             infer_channel(narration),
+            "debit":               round(debit, 2),
+            "credit":              round(credit, 2),
+            "balance":             0.0,  # Paytm format has no running balance
+            "utr_ref":             utr_ref,
+            "counterparty_name":   extract_counterparty(narration),
+            "counterparty_account": cp_account,
+            "counterparty_ifsc":   str(_get(row, "COD_PROD") or "").strip(),
+            "source_file":         os.path.basename(source_file),
+            "source_format":       source_format,
+            "ingestion_warnings":  "paytm_no_balance",
+        })
+
+    if not output_rows:
+        warnings.append("Paytm: no rows extracted")
+        return pd.DataFrame(columns=UNIFIED_SCHEMA), warnings
+
+    warnings.append(f"Paytm: {len(output_rows)} transactions")
+    return pd.DataFrame(output_rows, columns=UNIFIED_SCHEMA), warnings
+
+
+# ===========================================================================
+# Special normalizer: BOB / Federal / Bandhan XLSX (rich BENEF columns)
+# ===========================================================================
+def _normalize_bob_xlsx(raw_df, header_text, source_file, source_format,
+                         bank_name, provided_account_id, warnings) -> tuple:
+    warnings.append("BOB/Federal XLSX: extracting BENEF/REMIT counterparty data")
+
+    # Find actual header row
+    header_row_idx = find_header_row(raw_df)
+    if header_row_idx > 0:
+        new_cols = [str(v).strip() for v in raw_df.iloc[header_row_idx].values]
+        raw_df = raw_df.iloc[header_row_idx + 1:].copy()
+        raw_df.columns = new_cols
+        raw_df = raw_df.reset_index(drop=True)
+    raw_df = raw_df.dropna(how="all").reset_index(drop=True)
+
+    roles = assign_column_roles(raw_df.columns.tolist(), df=raw_df)
+
+    account_id = (
+        provided_account_id
+        or _extract_account_id_from_text(header_text)
+        or _extract_account_id_from_filename(source_file)
+    )
+    # BOB XLSX typically has "ACCOUNT NO." column
+    for acct_col in ("ACCOUNT NO.", "ACCOUNT NO", "ACCT_NO"):
+        if acct_col in raw_df.columns:
+            s = raw_df[acct_col].dropna()
+            if not s.empty:
+                account_id = str(s.iloc[0]).strip()
+                break
+
+    # Find BENEF columns (flexible naming)
+    benef_acct_col = None
+    benef_ifsc_col = None
+    benef_name_col = None
+    for col in raw_df.columns:
+        cl = col.upper()
+        if "BENEF" in cl and "ACCT" in cl and "NAME" not in cl:
+            benef_acct_col = col
+        if "BENEF" in cl and "IFSC" in cl:
+            benef_ifsc_col = col
+        if "BENEF" in cl and "NAME" in cl:
+            benef_name_col = col
+        if "REMIT" in cl and "ACCT" in cl and "NAME" not in cl:
+            benef_acct_col = benef_acct_col or col
+        if "REMIT" in cl and "IFSC" in cl:
+            benef_ifsc_col = benef_ifsc_col or col
+
+    account_holder = _extract_account_holder(header_text)
+    if not account_holder and "ACCOUNT NAME" in raw_df.columns:
+        s = raw_df["ACCOUNT NAME"].dropna()
+        account_holder = str(s.iloc[0]).strip() if not s.empty else ""
+
+    output_rows = []
+    skipped = 0
+    for _, row in raw_df.iterrows():
+        date_str = parse_date(_get(row, roles.get("date")))
+        if not date_str:
+            skipped += 1
+            continue
+
+        narration = str(_get(row, roles.get("narration")) or "").strip().upper()
+        if not narration:
+            narration = _build_narration_from_unmapped(row, roles)
+
+        debit, credit = 0.0, 0.0
+        if roles.get("debit") and roles.get("credit"):
+            debit,  ds = parse_amount(_get(row, roles["debit"]))
+            credit, cs = parse_amount(_get(row, roles["credit"]))
+            if ds == "+":
+                credit, debit = debit, 0.0
+            if cs == "-":
+                debit, credit = credit, 0.0
+
+            # BOB uses BALANCE INDICATOR 'C'/'D' — override if present
+            bi_col = roles.get("drcr")
+            if bi_col:
+                bi = str(_get(row, bi_col) or "").strip().upper()
+                # If both debit & credit are non-zero, use indicator to zero one
+                if bi in ("C", "CR") and debit > 0:
+                    credit, debit = debit + credit, 0.0
+                elif bi in ("D", "DR") and credit > 0:
+                    debit, credit = debit + credit, 0.0
+
+        elif roles.get("amount"):
+            amt, sign = parse_amount(_get(row, roles["amount"]))
+            bi_col = roles.get("drcr")
+            if bi_col:
+                bi = str(_get(row, bi_col) or "").strip().upper()
+                if bi in ("C", "CR"):
+                    credit = amt
+                else:
+                    debit = amt
+            elif sign == "+":
+                credit = amt
+            elif sign == "-":
+                debit = amt
+
+        balance, _ = parse_amount(_get(row, roles.get("balance")))
+
+        if debit == 0.0 and credit == 0.0 and balance == 0.0:
+            skipped += 1
+            continue
+
+        utr_ref = str(_get(row, roles.get("ref")) or "").strip()
+
+        # Extract counterparty from BENEF columns (definitive)
+        cp_account = str(_get(row, benef_acct_col) or "").strip() if benef_acct_col else ""
+        cp_ifsc    = str(_get(row, benef_ifsc_col) or "").strip() if benef_ifsc_col else ""
+        cp_name    = str(_get(row, benef_name_col) or "").strip() if benef_name_col else ""
+
+        # Fall back to narration extraction
+        if not cp_account:
+            cp_account = extract_counterparty_account(narration)
+        if not cp_ifsc:
+            cp_ifsc = extract_counterparty_ifsc(narration)
+        if not cp_name:
+            cp_name = extract_counterparty(narration)
+
+        output_rows.append({
+            "account_id":          account_id,
+            "account_holder":      account_holder,
+            "bank_name":           bank_name,
+            "date":                date_str,
+            "time":                _extract_time(row, roles),
+            "narration":           narration,
+            "channel":             infer_channel(narration),
+            "debit":               round(debit, 2),
+            "credit":              round(credit, 2),
+            "balance":             round(balance, 2),
+            "utr_ref":             utr_ref,
+            "counterparty_name":   cp_name,
+            "counterparty_account": cp_account,
+            "counterparty_ifsc":   cp_ifsc,
+            "source_file":         os.path.basename(source_file),
+            "source_format":       source_format,
+            "ingestion_warnings":  "",
+        })
+
+    if skipped:
+        warnings.append(f"BOB/Federal: skipped {skipped} non-transaction rows")
+    if not output_rows:
+        warnings.append("BOB/Federal: no rows extracted")
+        return pd.DataFrame(columns=UNIFIED_SCHEMA), warnings
+
+    warnings.append(f"BOB/Federal: {len(output_rows)} transactions")
+    return pd.DataFrame(output_rows, columns=UNIFIED_SCHEMA), warnings
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
 def _get(row, col_name):
     if not col_name:
         return None
@@ -240,12 +501,6 @@ def _get(row, col_name):
 
 
 def _build_narration_from_unmapped(row, roles: dict) -> str:
-    """
-    Fallback when no narration column was identified: concatenate
-    whatever columns this row has that weren't already mapped to a known
-    role, so a transaction's narration is never silently left blank just
-    because the file's narration column had an unrecognized header name.
-    """
     mapped = {col for col in roles.values() if col}
     parts = []
     for col, val in row.items():
@@ -258,31 +513,24 @@ def _build_narration_from_unmapped(row, roles: dict) -> str:
 
 
 def _extract_time(row, roles: dict) -> str:
-    """
-    Pull a real HH:MM:SS out of a dedicated time/timestamp column, or out
-    of the date column itself if it embeds a time component (e.g.
-    "2026-01-15 14:32:00"). Falls back to "00:00:00" only if neither
-    yields anything - most formats genuinely have no time information,
-    but plenty do and shouldn't be flattened to midnight.
-    """
+    import re
     for col in row.index:
         col_lower = str(col).lower()
         if "time" not in col_lower and "timestamp" not in col_lower:
             continue
         val = _get(row, col)
-
-        if val is None or pd.isna(val):
+        if val is None:
             continue
         m = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", str(val))
         if m:
-            hour, minute, second = m.group(1), m.group(2), m.group(3) or "00"
-            return f"{int(hour):02d}:{minute}:{second}"
+            h, mi, s = m.group(1), m.group(2), m.group(3) or "00"
+            return f"{int(h):02d}:{mi}:{s}"
 
     date_val = _get(row, roles.get("date"))
     m = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", str(date_val or ""))
     if m:
-        hour, minute, second = m.group(1), m.group(2), m.group(3) or "00"
-        return f"{int(hour):02d}:{minute}:{second}"
+        h, mi, s = m.group(1), m.group(2), m.group(3) or "00"
+        return f"{int(h):02d}:{mi}:{s}"
     return "00:00:00"
 
 
@@ -291,6 +539,8 @@ def _extract_account_holder(text: str) -> str:
         return ""
     patterns = [
         r"(?:account holder|account name|name|customer)[:\s]+([A-Za-z][A-Za-z\s\.]{2,40}?)(?:\n|$|account|ifsc)",
+        r"(?:A/C Name|Ac Name)\s*:\s*([A-Za-z\s\.MR\.MRS\.]{3,40})",
+        r"(?:Accountholder Name)\s*:\s*(MR\.?\s*[A-Za-z\s\.]{3,40})",
     ]
     for p in patterns:
         m = re.search(p, text, re.IGNORECASE)
@@ -300,17 +550,10 @@ def _extract_account_holder(text: str) -> str:
 
 
 def _extract_account_id_from_text(text: str) -> str:
-    """
-    Pull the actual account number out of the statement header text
-    (e.g. "Account Number: 14729595422743"), checked BEFORE falling back
-    to the filename. Most real statements carry the account number
-    somewhere in their header; relying on the filename alone misses that
-    whenever the file is named something generic like "statement.csv".
-    """
     if not text:
         return ""
     patterns = [
-        r"(?:account\s*(?:no|number|id)|a/c\s*(?:no|number)|acct\s*(?:no|number))\s*[:\-]?\s*([A-Z0-9X*]{6,24})",
+        r"(?:account\s*(?:no|number|id)|a/c\s*(?:no|number)|acct\s*(?:no|number)|ECS A/c No\.?)\s*[:\-]?\s*([A-Z0-9X*]{6,24})",
         r"\b(\d{9,18})\b",
     ]
     for pattern in patterns:
@@ -321,8 +564,12 @@ def _extract_account_id_from_text(text: str) -> str:
 
 
 def _extract_account_id_from_filename(filename: str) -> str:
-    m = re.search(r"(ACC\d+)", os.path.basename(filename))
+    base = os.path.splitext(os.path.basename(filename))[0]
+    # If filename IS the account number (most common in dataset)
+    m = re.match(r"^(\d{8,18})", base)
     if m:
         return m.group(1)
-    return re.sub(r"[^A-Za-z0-9_]", "_",
-                  os.path.splitext(os.path.basename(filename))[0])[:20]
+    m = re.search(r"(ACC\d+)", base)
+    if m:
+        return m.group(1)
+    return re.sub(r"[^A-Za-z0-9_]", "_", base)[:20]
