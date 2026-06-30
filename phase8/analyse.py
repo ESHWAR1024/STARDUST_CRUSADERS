@@ -373,7 +373,7 @@ def _write_summary(
         "=" * 70,
     ]
 
-    with open(os.path.join(out_dir, "analytics_summary.txt"), "w") as f:
+    with open(os.path.join(out_dir, "analytics_summary.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
 

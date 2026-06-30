@@ -1,0 +1,26 @@
+{
+  "run_timestamp": "2026-06-30T22:16:09.532901",
+  "input_file": "training_data_merged_all18.csv",
+  "rows_input": 135660,
+  "accounts": 518,
+  "graph": {
+    "txn_graph_nodes": 2642,
+    "txn_graph_edges": 69779,
+    "account_graph_nodes": 2642,
+    "account_graph_edges": 27684,
+    "weakly_connected_comps": 21
+  },
+  "round_trips": 97113,
+  "layering_chains": 0,
+  "fan_in": 172,
+  "fan_out": 352,
+  "smurfing": 11,
+  "odd_hours": 413,
+  "accounts_scored": 518,
+  "critical_accounts": 0,
+  "high_accounts": 4,
+  "medium_accounts": 154,
+  "trail_manifest": [],
+  "rows_output": 135660,
+  "total_flagged_rows": 21188
+}

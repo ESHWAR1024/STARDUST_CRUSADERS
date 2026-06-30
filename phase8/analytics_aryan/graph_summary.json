@@ -1,0 +1,7 @@
+{
+  "txn_graph_nodes": 5,
+  "txn_graph_edges": 4,
+  "account_graph_nodes": 5,
+  "account_graph_edges": 4,
+  "weakly_connected_comps": 1
+}

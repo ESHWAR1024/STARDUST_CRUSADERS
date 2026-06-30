@@ -1,0 +1,7 @@
+{
+  "txn_graph_nodes": 2642,
+  "txn_graph_edges": 69779,
+  "account_graph_nodes": 2642,
+  "account_graph_edges": 27684,
+  "weakly_connected_comps": 21
+}

@@ -1,0 +1,106 @@
+======================================================================
+PHASE 8 — INVESTIGATION ANALYTICS SUMMARY
+Run at : 2026-06-30T22:16:09.532901
+Input  : training_data_merged_all18.csv
+======================================================================
+
+OVERVIEW
+----------------------------------------
+  Rows analysed           : 135,660
+  Accounts analysed       : 518
+  Rows with analytics flag: 21,188
+
+GRAPH STATISTICS
+----------------------------------------
+  Graph nodes             : 2642
+  Graph edges (transfers) : 69779
+  Connected components    : 21
+
+PATTERN DETECTION RESULTS
+----------------------------------------
+  Round-trips             : 97113
+  Layering chains         : 0
+  Fan-in collectors       : 172
+  Fan-out distributors    : 352
+  Smurfing / structuring  : 11
+  Odd-hour accounts       : 413
+
+RISK SCORE DISTRIBUTION
+----------------------------------------
+  CRITICAL (≥75)          : 0
+  HIGH     (≥50)          : 4
+  MEDIUM   (≥25)          : 154
+  LOW      (<25)          : 360
+
+TOP 10 HIGHEST-RISK ACCOUNTS
+----------------------------------------
+  [HIGH    ] 99572217148131 Score: 68.0  Indian
+             Patterns : ROUND_TRIP | FAN_IN | FAN_OUT | SMURFING | ODD_HOUR | NEW_HV_BENE
+             Reasoning: Round-trip: ₹40,000 sent to Head Office, ₹126,100 returned in 9.0d | Fan-in collector: ₹269,369 from
+
+  [HIGH    ] 2248145316   Score: 68.0  nan
+             Patterns : ROUND_TRIP | FAN_IN | FAN_OUT | SMURFING | ODD_HOUR | NEW_HV_BENE
+             Reasoning: Round-trip: ₹50,000 sent to Icic, ₹200,000 returned in 4.0d | Fan-in collector: ₹2,625,224 from 8 se
+
+  [HIGH    ] 098030016134598 Score: 63.0  nan
+             Patterns : ROUND_TRIP | FAN_IN | FAN_OUT | SMURFING | ODD_HOUR
+             Reasoning: Round-trip: ₹19,600 sent to Neft, ₹202,000 returned in 1.0d | Fan-in collector: ₹5,791,595 from 7 se
+
+  [HIGH    ] 18306700003  Score: 60.0  nan
+             Patterns : ROUND_TRIP | FAN_IN | FAN_OUT | SMURFING | NEW_HV_BENE
+             Reasoning: Round-trip: ₹282,382 sent to 2025_A, ₹282,382 returned in 6.9d | Fan-in collector: ₹19,354,553 from 
+
+  [MEDIUM  ] 8642666611469255 Score: 48.0  nan
+             Patterns : ROUND_TRIP | FAN_IN | FAN_OUT | ODD_HOUR
+             Reasoning: Round-trip: ₹49,000 sent to Mohamme, ₹40,000 returned in 30.0d | Fan-in collector: ₹92,251 from 12 s
+
+  [MEDIUM  ] 24704559049070 Score: 48.0  Indian
+             Patterns : FAN_IN | FAN_OUT | SMURFING | ODD_HOUR | NEW_HV_BENE
+             Reasoning: Fan-in collector: ₹4,058,285 from 29 senders | Fan-out: ₹1,476,375 to 4 receivers | Smurfing: 13 str
+
+  [MEDIUM  ] ACC000345    Score: 48.0  Wyatt Bhatt
+             Patterns : FAN_IN | FAN_OUT | SMURFING | ODD_HOUR | NEW_HV_BENE
+             Reasoning: Fan-in collector: ₹28,256 from 14 senders | Fan-out: ₹47,967 to 4 receivers | Smurfing: 3 structured
+
+  [MEDIUM  ] 43920027363506 Score: 48.0  Indian
+             Patterns : FAN_IN | FAN_OUT | SMURFING | ODD_HOUR | NEW_HV_BENE
+             Reasoning: Fan-in collector: ₹15,344,792 from 9 senders | Fan-out: ₹8,182,962 to 15 receivers | Smurfing: 6 str
+
+  [MEDIUM  ] 72615533841078 Score: 48.0  Indian
+             Patterns : FAN_IN | FAN_OUT | SMURFING | ODD_HOUR | NEW_HV_BENE
+             Reasoning: Fan-in collector: ₹5,252,904 from 38 senders | Fan-out: ₹5,071,482 to 17 receivers | Smurfing: 29 st
+
+  [MEDIUM  ] 50192424882238 Score: 43.0  Indian
+             Patterns : FAN_IN | FAN_OUT | SMURFING | ODD_HOUR
+             Reasoning: Fan-in collector: ₹13,737,978 from 26 senders | Fan-out: ₹8,898,252 to 21 receivers | Smurfing: 11 s
+
+ROUND-TRIP DETAIL
+----------------------------------------
+  2248145316 sent ₹50,000 to Icic on 2025-04-05, ₹200,000 (400%) returned 4.0d later
+  2248145316 sent ₹50,000 to Icic on 2025-04-05, ₹50,000 (100%) returned 4.0d later
+  18306700003 sent ₹282,382 to 2025_A on 2025-06-23, ₹282,382 (100%) returned 6.9d later
+  18306700003 sent ₹282,382 to 2025_A on 2025-06-23, ₹282,382 (100%) returned 17.9d later
+  99572217148131 sent ₹40,000 to Head Office on 2025-03-25, ₹126,100 (315%) returned 9.0d later
+  99572217148131 sent ₹100,000 to Head Office on 2025-03-26, ₹126,100 (126%) returned 8.0d later
+  99572217148131 sent ₹157,000 to Head Office on 2025-03-28, ₹126,100 (80%) returned 6.0d later
+  99572217148131 sent ₹41,990 to Head Office on 2025-03-28, ₹126,100 (300%) returned 6.0d later
+  8642666611469255 sent ₹49,000 to Mohamme on 2025-03-17, ₹40,000 (82%) returned 30.0d later
+  8642666611469255 sent ₹10,000 to Anjali on 2025-03-20, ₹22,000 (220%) returned 2.0d later
+
+OUTPUT FILES
+----------------------------------------
+  account_graph.pkl            ← NetworkX DiGraph → feed directly to Phase 9
+  analytics_transactions.csv   ← all rows + Phase 8 flags → Feed to Phase 9/10
+  round_trips.csv              ← round-trip findings
+  layering_chains.csv          ← layering chain findings
+  fan_in.csv                   ← collector account findings
+  fan_out.csv                  ← distribution account findings
+  smurfing.csv                 ← structuring findings
+  odd_hours.csv                ← odd-hour findings
+  beneficiaries.csv            ← beneficiary profiles per account
+  risk_scores.csv              ← per-account risk score, tier, reasoning
+  money_trails/                ← forward/backward fund traces for top accounts
+  graph_summary.json           ← graph statistics
+  analytics_report.json        ← machine-readable full report
+  analytics_summary.txt        ← this file
+======================================================================

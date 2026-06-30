@@ -1,0 +1,43 @@
+{
+  "run_timestamp": "2026-06-30T18:26:23.774753",
+  "input_file": "aryan_cleaned.csv",
+  "rows_input": 848,
+  "accounts": 1,
+  "graph": {
+    "txn_graph_nodes": 5,
+    "txn_graph_edges": 4,
+    "account_graph_nodes": 5,
+    "account_graph_edges": 4,
+    "weakly_connected_comps": 1
+  },
+  "round_trips": 0,
+  "layering_chains": 0,
+  "fan_in": 0,
+  "fan_out": 0,
+  "smurfing": 0,
+  "odd_hours": 1,
+  "accounts_scored": 1,
+  "critical_accounts": 0,
+  "high_accounts": 0,
+  "medium_accounts": 0,
+  "trail_manifest": [
+    {
+      "account": "589302010011548",
+      "direction": "forward",
+      "hops": 0,
+      "trails": 0,
+      "status": "no_internal_counterparties",
+      "file": "trail_589302010011548_forward.csv"
+    },
+    {
+      "account": "589302010011548",
+      "direction": "backward",
+      "hops": 0,
+      "trails": 0,
+      "status": "no_internal_counterparties",
+      "file": "trail_589302010011548_backward.csv"
+    }
+  ],
+  "rows_output": 848,
+  "total_flagged_rows": 848
+}
