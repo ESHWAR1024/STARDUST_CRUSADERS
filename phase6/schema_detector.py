@@ -468,6 +468,17 @@ def parse_date(val) -> str:
     s = re.sub(r'[\r\n]+', ' ', s)
     s = re.sub(r'\s+', ' ', s).strip()
 
+    # PDF table extraction frequently wraps a date cell onto two lines at
+    # the separator (e.g. pdfplumber turns "23-FEB-2025" into "23-FEB-\n2025"
+    # when the cell text wraps). The newline collapse above turns that into
+    # "23-FEB- 2025" — a stray space sitting right next to the separator
+    # that no strptime format tolerates. This is a general PDF-extraction
+    # artifact (seen across IDFC, Bandhan, RBL, BOB statements alike), not
+    # bank-specific, so it's corrected unconditionally before any format
+    # matching is attempted: collapse whitespace that sits immediately
+    # before/after a date separator (/, -, .).
+    s = re.sub(r'\s*([/\-.])\s*', r'\1', s)
+
     # Strip embedded time component (IDFC: "15/05/25 10:20 15/05/25")
     m = _IDFC_DT_RE.match(s)
     if m:
