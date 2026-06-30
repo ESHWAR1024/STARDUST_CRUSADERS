@@ -268,9 +268,14 @@ def parse_pdf(file_path, password=None, password_candidates=None):
 
     if all_rows and headers:
         df = pd.DataFrame(all_rows, columns=headers).replace("", np.nan)
-        warnings.append(f"PDF table: {len(df)} rows, {len(headers)} cols "
-                        f"(bank={bank_hint})")
-        return df, header_text, "pdf", warnings
+        if _is_valid_transaction_table(df):
+            warnings.append(f"PDF table: {len(df)} rows, {len(headers)} cols "
+                            f"(bank={bank_hint})")
+            return df, header_text, "pdf", warnings
+        warnings.append(
+            f"PDF table detected but invalid transaction table: {len(df)} rows, {len(headers)} cols "
+            f"(bank={bank_hint})"
+        )
 
     # ── fallback cascade ──────────────────────────────────────────────────
     warnings.append("No tables — trying text fallbacks")
@@ -366,7 +371,19 @@ def _pdf_text_fallback(file_path, header_text, bank_hint, all_text_lines, warnin
             warnings.append("PDF: date/amount line parser")
             return df, header_text, "pdf", warnings
 
-        # Layer B: generic word-position
+        # Layer B: double-space text split
+        df = _text_line_df(all_text_lines, double_space=True)
+        if not df.empty:
+            warnings.append("PDF: text-line double-space parser")
+            return df, header_text, "pdf", warnings
+
+        # Layer C: single-space split
+        df = _text_line_df(all_text_lines, double_space=False)
+        if not df.empty:
+            warnings.append("PDF: text-line single-space parser")
+            return df, header_text, "pdf", warnings
+
+        # Layer D: generic word-position
         with pdfplumber.open(file_path) as pdf:
             df = _word_position_parser(pdf, warnings)
         if not df.empty:
@@ -374,18 +391,6 @@ def _pdf_text_fallback(file_path, header_text, bank_hint, all_text_lines, warnin
                 warnings.append("PDF: generic word-position parser")
                 return df, header_text, "pdf", warnings
             warnings.append("PDF: generic word-position parser produced invalid table")
-
-        # Layer C: double-space text split
-        df = _text_line_df(all_text_lines, double_space=True)
-        if not df.empty:
-            warnings.append("PDF: text-line double-space parser")
-            return df, header_text, "pdf", warnings
-
-        # Layer D: single-space split
-        df = _text_line_df(all_text_lines, double_space=False)
-        if not df.empty:
-            warnings.append("PDF: text-line single-space parser")
-            return df, header_text, "pdf", warnings
 
         # Layer E: scanned PDF OCR fallback
         ocr_df, ocr_header, ocr_warnings = _pdf_ocr_fallback(file_path, warnings)
@@ -859,8 +864,11 @@ def _text_line_df(lines, double_space=True):
     hdr_idx = None
     for i, line in enumerate(lines):
         hits = sum(1 for k in _HDR_KW if k in line.lower())
-        if hits >= 3: hdr_idx = i; break
-    if hdr_idx is None: return pd.DataFrame()
+        if hits >= 3:
+            hdr_idx = i
+            break
+    if hdr_idx is None:
+        return pd.DataFrame()
 
     splitter = (lambda l: [p.strip() for p in re.split(r'\s{2,}', l) if p.strip()]
                 if double_space
@@ -869,18 +877,44 @@ def _text_line_df(lines, double_space=True):
         splitter = lambda l: l.strip().split()
 
     col_names = splitter(lines[hdr_idx])
-    if len(col_names) < 4: return pd.DataFrame()
+    if len(col_names) < 4:
+        return pd.DataFrame()
     n = len(col_names)
-    SKIP = ["account holder","ifsc","page","statement period","generated"]
-    rows = []
+
+    SKIP = ["account holder", "ifsc", "page", "statement period", "generated"]
+    merged_rows = []
+    buffer = ""
+    date_re = re.compile(r'^[0-3]?\d/[0-1]?\d/\d{2,4}\b')
+
     for line in lines[hdr_idx+1:]:
-        if not line or len(line) < 8: continue
-        if any(k in line.lower() for k in SKIP): continue
+        if not line or len(line) < 8:
+            continue
+        lower = line.lower()
+        if any(k in lower for k in SKIP):
+            continue
+        if date_re.match(line.strip()):
+            if buffer:
+                merged_rows.append(buffer)
+            buffer = line.strip()
+        else:
+            if buffer:
+                buffer = f"{buffer} {line.strip()}"
+            else:
+                buffer = line.strip()
+    if buffer:
+        merged_rows.append(buffer)
+
+    rows = []
+    for line in merged_rows:
         parts = splitter(line)
-        if abs(len(parts)-n) > 3: continue
-        while len(parts) < n: parts.append("")
+        if abs(len(parts) - n) > 3:
+            continue
+        while len(parts) < n:
+            parts.append("")
         rows.append(parts[:n])
-    if not rows: return pd.DataFrame()
+
+    if not rows:
+        return pd.DataFrame()
     return pd.DataFrame(rows, columns=col_names)
 
 
@@ -1058,6 +1092,79 @@ def parse_json(file_path):
         return pd.DataFrame(), "", "json", [f"JSON error: {e}"]
 
 
+# ── Kerala Gramin / fixed-width TXT special-case parser
+def _parse_kerala_gramin_txt(lines):
+    """Attempt to parse Kerala Gramin / similar fixed-width bank text dumps.
+    Looks for lines starting with a date and trailing amount tokens.
+    Returns (df, warnings_list) where warnings_list may be empty.
+    """
+    warnings = []
+    rows = []
+    date_re = re.compile(r'^\s*\d{1,2}[-/ ]\d{1,2}[-/ ]\d{2,4}')
+    amt_re = re.compile(r'[\d,]+\.\d{2}')
+    for raw in lines:
+        line = str(raw).strip()
+        if not line:
+            continue
+        if not date_re.match(line):
+            continue
+        # split on 2+ spaces or tabs (common fixed-width separators)
+        parts = re.split(r'\t|\s{2,}', line)
+        # fallback to whitespace split if nothing else
+        if len(parts) <= 1:
+            parts = line.split()
+
+        # heuristics: first part date, last part balance, second-last maybe amount
+        date = parts[0]
+        balance = ''
+        debit = ''
+        credit = ''
+        narration = ''
+        if len(parts) >= 3 and amt_re.search(parts[-1]):
+            balance = parts[-1]
+            # try detect amount before balance
+            if len(parts) >= 4 and amt_re.search(parts[-2]):
+                amt = parts[-2]
+                narration = ' '.join(parts[1:-2]).strip()
+            else:
+                amt = parts[-2] if len(parts) >= 2 else ''
+                narration = ' '.join(parts[1:-1]).strip()
+        elif len(parts) >= 2 and amt_re.search(parts[-1]):
+            amt = parts[-1]
+            narration = ' '.join(parts[1:-1]).strip()
+        else:
+            # no obvious amounts; skip
+            continue
+
+        if isinstance(amt, str) and amt_re.search(amt):
+            amt_clean = amt.replace(',', '')
+            # determine dr/cr by presence of CR/DR suffix or by position
+            if re.search(r'CR$|Cr$|CR\b', amt) or re.search(r'CR$|Cr$|CR\b', balance if balance else ''):
+                credit = amt
+            elif re.search(r'DR$|Dr$|DR\b', amt) or re.search(r'DR$|Dr$|DR\b', balance if balance else ''):
+                debit = amt
+            else:
+                # ambiguous: treat as credit if balance increases, else debit
+                credit = amt
+        else:
+            continue
+
+        rows.append({
+            "date": date,
+            "time": "00:00:00",
+            "narration": narration,
+            "debit": debit,
+            "credit": credit,
+            "balance": balance,
+            "utr_ref": "",
+        })
+
+    if not rows:
+        return pd.DataFrame(), []
+    warnings.append(f"KeralaGraminTXT: {len(rows)} rows parsed")
+    return pd.DataFrame(rows), warnings
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TXT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1083,6 +1190,18 @@ def parse_txt(file_path):
     nonblank = [line.rstrip() for line in lines if line.strip()]
     if not nonblank:
         return pd.DataFrame(), "", "txt", ["TXT file contains only blank lines"]
+
+    # Special-case: Kerala Gramin / fixed-width style statements
+    try:
+        sample_head = "\n".join(nonblank[:10]).lower()
+    except Exception:
+        sample_head = ""
+    if "kerala gramin" in sample_head or re.search(r'^\s*\d{1,2}[-/ ]\d{1,2}[-/ ]\d{2,4}', nonblank[0]):
+        df_k, kw = _parse_kerala_gramin_txt(nonblank)
+        if not df_k.empty:
+            warnings.extend(kw)
+            warnings.insert(0, "TXT: Kerala Gramin fixed-width parser")
+            return df_k, "", "txt", warnings
 
     df = _text_line_df(nonblank, double_space=True)
     if not df.empty:

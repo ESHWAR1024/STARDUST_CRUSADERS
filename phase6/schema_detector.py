@@ -465,6 +465,9 @@ def parse_date(val) -> str:
     if not s or s.lower() in ("nan", "none", "date", "-", "n/a", ""):
         return ""
 
+    s = re.sub(r'[\r\n]+', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+
     # Strip embedded time component (IDFC: "15/05/25 10:20 15/05/25")
     m = _IDFC_DT_RE.match(s)
     if m:
@@ -481,6 +484,25 @@ def parse_date(val) -> str:
         for fmt in DATE_FORMATS:
             try:
                 return datetime.strptime(s_fixed, fmt).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                continue
+
+    # Try each whitespace-separated token in noisy cells
+    for candidate in re.split(r'[\s,;|]+', s):
+        if not candidate or candidate.lower() in ("cr", "dr", "cr.", "dr."):
+            continue
+        for fmt in DATE_FORMATS:
+            try:
+                return datetime.strptime(candidate, fmt).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                continue
+
+    # Extract the first date-like substring from longer values
+    for match in re.finditer(r'\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}', s):
+        token = match.group(0)
+        for fmt in DATE_FORMATS:
+            try:
+                return datetime.strptime(token, fmt).strftime("%Y-%m-%d")
             except (ValueError, TypeError):
                 continue
 

@@ -174,6 +174,13 @@ def normalize(
 
     for _, row in raw_df.iterrows():
         date_str = parse_date(_get(row, roles.get("date")))
+        # Fallback: if assigned date column didn't parse, try finding
+        # a date-like token anywhere in the row (some PDFs split columns)
+        if not date_str:
+            all_text = " ".join(str(_get(row, c) or "") for c in raw_df.columns)
+            m = re.search(r"\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}", all_text)
+            if m:
+                date_str = parse_date(m.group(0))
         if not date_str:
             skipped += 1
             continue
