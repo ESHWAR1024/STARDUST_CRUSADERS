@@ -315,7 +315,14 @@ def parse_pdf(file_path, password=None, password_candidates=None):
                     pass
 
             header_text = "\n".join(text_chunks)
-            bank_hint = _detect_bank_hint(header_text)
+            # Bank identity should come from the statement's own header
+            # (branch/IFSC/account-holder block on page 1), not the whole
+            # document. On a 100+ page statement, some OTHER bank's name
+            # is almost guaranteed to show up in a transaction narration
+            # somewhere (e.g. "NEFT to XYZ Bank") — scanning the full text
+            # let that override the correct detection.
+            first_page_text = text_chunks[0] if text_chunks else header_text
+            bank_hint = _detect_bank_hint(first_page_text)
 
     except Exception as e:
         err = str(e)
@@ -329,7 +336,11 @@ def parse_pdf(file_path, password=None, password_candidates=None):
                 header_text = "\n".join(text_chunks)
         except NameError:
             pass
-        bank_hint = _detect_bank_hint(header_text)
+        try:
+            first_page_text = text_chunks[0] if text_chunks else header_text
+        except NameError:
+            first_page_text = header_text
+        bank_hint = _detect_bank_hint(first_page_text)
 
     if all_rows and headers:
         df = pd.DataFrame(all_rows, columns=headers).replace("", np.nan).infer_objects(copy=False)
@@ -769,26 +780,65 @@ def _parse_date_amount_lines(lines, warnings):
     # rejected, causing every row to fail and fall through to the far
     # less reliable generic word-position parser.
     amount_re = re.compile(r'^[\d,]+\.\d{2}(?:\s*\(?(?:CR|DR)\)?)?$', re.IGNORECASE)
+    # A line that's ONLY a bare amount (optionally with Cr/Dr) — used to
+    # detect a balance that wrapped onto its own line (Central Bank of
+    # India does this when the narration pushes the row past one line).
+    bare_amount_re = re.compile(r'^[\d,]+\.\d{2}\s*(?:CR|DR)?$', re.IGNORECASE)
+    # DD-MM-YYYY or DD/MM/YY(YY) — some banks (HDFC, Central Bank of
+    # India) use slashes and/or 2-digit years instead of the dashed
+    # 4-digit form this parser originally only accepted.
+    date_re = r'(\d{2}[-/]\d{2}[-/]\d{2,4})'
+    row_re = re.compile(rf'^{date_re}(?:\s+{date_re})?(\S*)\s+(.+)$')
     # Header keyword sets — broadened beyond one hardcoded string so this
     # generic parser catches any "date + narration + trailing amount(s) +
     # balance" statement layout (DCB Bank, Kotak, and others all match
     # this shape but each phrases the header line differently).
     _date_kw = ("date",)
     _amt_kw = ("withdraw", "deposit", "debit", "credit", "amount", "balance", "particular")
-    for raw in lines:
-        line = str(raw).strip()
+
+    n = len(lines)
+    i = 0
+    while i < n:
+        line = str(lines[i]).strip()
+        i += 1
         if not line:
             continue
         if not header_seen:
             ll = line.lower()
-            if any(k in ll for k in _date_kw) and any(k in ll for k in _amt_kw):
+            # Some statements (e.g. Karnataka Bank) never print a repeated
+            # column-header row at all — the first real signal is the
+            # "OPENING BALANCE" / "BROUGHT FORWARD" line right before the
+            # transactions start.
+            if (any(k in ll for k in _date_kw) and any(k in ll for k in _amt_kw)) \
+                    or "opening balance" in ll or "brought forward" in ll:
                 header_seen = True
+                if "opening balance" in ll or "brought forward" in ll:
+                    tail = re.split(r'[:\s]+', line)[-1].strip()
+                    if bare_amount_re.match(tail):
+                        prev_balance, _ = _simple_amount_parse(tail)
+                continue
+            # No header line and no opening-balance line at all (seen on
+            # some HDFC exports) — bootstrap from the data itself: if this
+            # line already looks like a complete transaction row (date +
+            # narration + 2+ trailing amounts), that's proof enough that
+            # we're already past any header and can start right here.
+            probe = row_re.match(line)
+            if probe:
+                probe_tail = re.split(r'\s+', probe.group(4))
+                probe_amounts = sum(1 for t in probe_tail[-3:] if amount_re.match(t))
+                if probe_amounts >= 2:
+                    header_seen = True
+                    i -= 1  # reprocess this line as a transaction below
+                    continue
             continue
         if line.startswith("Id Date"):
             continue
         if line.startswith("Account Opening balance") or line.startswith("Opening Balance"):
             continue
-        if line.startswith("Brought Forward"):
+        if line.startswith("Brought Forward") or line.upper().startswith("BROUGHT FORWARD"):
+            bf_val, _ = _simple_amount_parse(line.split(":", 1)[-1].strip())
+            if bare_amount_re.match(line.split(":", 1)[-1].strip()):
+                prev_balance = bf_val
             continue
         if line.startswith("B/F"):
             # "B/F 0.00(Cr)" — Kotak's opening balance line. Capturing it
@@ -807,21 +857,46 @@ def _parse_date_amount_lines(lines, warnings):
             continue
         if line.startswith("Page") or ("Page" in line and not amount_re.search(line)):
             continue
+        # Pure narration-continuation / placeholder lines (Central Bank of
+        # India prints ". . SOME MORE TEXT ." for wrapped narration) —
+        # not a new transaction, and not a bare balance either. Skip.
+        if re.match(r'^[.\s]*$', line) or (line.startswith(".") and not bare_amount_re.match(line)):
+            continue
 
-        m = re.match(r'^(\d{2}-\d{2}-\d{4})(\S*)\s+(.+)$', line)
+        m = row_re.match(line)
         if not m:
             continue
-        date, txn_code, rest = m.groups()
+        date, _post_date, txn_code, rest = m.groups()
         tokens = re.split(r'\s+', rest)
         trailing = []
         while tokens and amount_re.match(tokens[-1]):
             trailing.insert(0, tokens.pop())
+        # drop a lone "." / "-" placeholder token that sits where an
+        # empty Chq.No/Debit/Credit column would be
+        while tokens and tokens[-1] in (".", "-"):
+            tokens.pop()
 
-        if len(trailing) < 2:
+        wrapped_balance = None
+        if len(trailing) == 1:
+            # Only one amount on this line — peek at the next non-blank
+            # line: if it's a bare amount, the balance wrapped onto its
+            # own line rather than staying on the transaction row.
+            j = i
+            while j < n and not str(lines[j]).strip():
+                j += 1
+            if j < n and bare_amount_re.match(str(lines[j]).strip()):
+                wrapped_balance = str(lines[j]).strip()
+                i = j + 1
+
+        if len(trailing) < 2 and wrapped_balance is None:
             continue
 
-        balance_token = trailing[-1]
-        amount_tokens = trailing[:-1]
+        if wrapped_balance is not None:
+            balance_token = wrapped_balance
+            amount_tokens = trailing
+        else:
+            balance_token = trailing[-1]
+            amount_tokens = trailing[:-1]
         narration = " ".join(tokens).strip()
         utr_ref = ""
         debit = credit = 0.0
